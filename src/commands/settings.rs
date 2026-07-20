@@ -89,38 +89,46 @@ async fn handle_view(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
         }
     }
 
+    let embed = match build_settings_embed(pool, guild_id_i64).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to read settings");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    };
+
+    let msg = CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .components(vec![settings_select_row()])
+        .ephemeral(true);
+    let _ = cmd
+        .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
+        .await;
+}
+
+/// Shared by `/settings view` and the modal's success path (which refreshes
+/// the same view in place), so both always show identical, up-to-date data.
+async fn build_settings_embed(pool: &PgPool, guild_id_i64: i64) -> Result<CreateEmbed, sqlx::Error> {
     let mut embed = CreateEmbed::new()
         .title("Server settings")
-        .description("Rules and cooldowns for this server. Change any of these with `/settings set`.")
+        .description("Rules and cooldowns for this server. Change any of these with `/settings set` or the dropdown below.")
         .color(0x5865F2);
 
     for def in settings::SETTINGS_REGISTRY {
-        let value = match settings::get_int_setting(pool, guild_id_i64, def.key, def.default).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(error = ?e, key = def.key, "failed to read setting");
-                return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
-            }
-        };
+        let value = settings::get_int_setting(pool, guild_id_i64, def.key, def.default).await?;
         embed = embed.field(
             def.key,
             format!("**{value} minutes** (default: {})\n{}", def.default, def.description),
             false,
         );
     }
+    Ok(embed)
+}
 
-    let select = CreateActionRow::SelectMenu(
-        CreateSelectMenu::new(SETTINGS_SELECT_ID, settings_select_kind())
-            .placeholder("Change a setting"),
-    );
-
-    let msg = CreateInteractionResponseMessage::new()
-        .embed(embed)
-        .components(vec![select])
-        .ephemeral(true);
-    let _ = cmd
-        .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
-        .await;
+fn settings_select_row() -> CreateActionRow {
+    CreateActionRow::SelectMenu(
+        CreateSelectMenu::new(SETTINGS_SELECT_ID, settings_select_kind()).placeholder("Change a setting"),
+    )
 }
 
 /// Builds the select menu's options from the registry so the dropdown stays
@@ -313,11 +321,34 @@ pub async fn handle_modal(ctx: &Context, pool: &PgPool, modal: &ModalInteraction
         return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
     }
 
-    reply_modal_ephemeral(ctx, modal, &format!("Set {key} = {value}.")).await;
+    // Refresh the /settings view message the dropdown was opened from,
+    // rather than sending a separate confirmation — the updated field value
+    // is the confirmation. Falls back to a plain ephemeral reply if the
+    // refresh itself fails to read back (rare: same pool, right after write).
+    // Ack first, before the logging POST below — log() is a network call and
+    // must stay out of the interaction's 3-second ack budget.
+    match build_settings_embed(pool, guild_id_i64).await {
+        Ok(embed) => {
+            let msg = CreateInteractionResponseMessage::new()
+                .content(format!("Updated `{key}`."))
+                .embed(embed)
+                .components(vec![settings_select_row()]);
+            if let Err(e) = modal
+                .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(msg))
+                .await
+            {
+                tracing::error!(error = ?e, "failed to refresh settings view after update");
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to refresh settings view after update");
+            reply_modal_ephemeral(ctx, modal, &format!("Set {key} = {value}, but the view couldn't refresh — re-run /settings view.")).await;
+        }
+    }
 
-    let embed = CreateEmbed::new()
+    let log_embed = CreateEmbed::new()
         .title("Setting changed")
         .description(format!("<@{}> set `{key}` = `{value}`", modal.user.id))
         .color(0x5865F2);
-    let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
+    let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, log_embed).await;
 }
