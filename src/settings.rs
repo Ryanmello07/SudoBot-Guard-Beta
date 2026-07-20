@@ -6,6 +6,12 @@ pub const ADMIN_REGEN_COOLDOWN_MINUTES_DEFAULT: i64 = 1440;
 pub const ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_KEY: &str = "admin_regen_completion_window_minutes";
 pub const ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_DEFAULT: i64 = 1440;
 
+/// Generous upper bound for any minutes-valued setting (~30 days). Chosen so
+/// two such settings summed together (e.g. a cooldown plus a completion
+/// window) stay far below i32::MAX when narrowed for interval arithmetic,
+/// with no realistic legitimate use case anywhere close to this ceiling.
+pub const MAX_SETTING_MINUTES: i64 = 43_200;
+
 /// A single configurable, integer-valued (minutes) server setting: its
 /// storage key, a human-readable description shown in `/settings view`, and
 /// its default when unset. Add new entries here as the bot grows more
@@ -31,9 +37,10 @@ pub const SETTINGS_REGISTRY: &[SettingDefinition] = &[
     },
 ];
 
-/// All settings currently take a positive integer number of minutes, so
-/// validation is uniform across the whole registry — no per-key match
-/// needed unless a future setting has different rules.
+/// All settings currently take a positive integer number of minutes, capped
+/// well under i32::MAX so values can never overflow/wrap when narrowed to
+/// i32 for interval arithmetic (Postgres `make_interval` and similar) — no
+/// per-key match needed unless a future setting has different rules.
 pub fn validate_setting(key: &str, value: &str) -> Result<(), String> {
     if !SETTINGS_REGISTRY.iter().any(|s| s.key == key) {
         return Err(format!("unknown setting: {key}"));
@@ -43,6 +50,9 @@ pub fn validate_setting(key: &str, value: &str) -> Result<(), String> {
         .map_err(|_| "must be a positive integer (minutes)".to_string())?;
     if n <= 0 {
         return Err("must be positive".to_string());
+    }
+    if n > MAX_SETTING_MINUTES {
+        return Err(format!("must be at most {MAX_SETTING_MINUTES} minutes ({} days)", MAX_SETTING_MINUTES / 1440));
     }
     Ok(())
 }
@@ -137,5 +147,22 @@ mod tests {
         let keys: Vec<&str> = SETTINGS_REGISTRY.iter().map(|s| s.key).collect();
         assert!(keys.contains(&ADMIN_REGEN_COOLDOWN_MINUTES_KEY));
         assert!(keys.contains(&ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_KEY));
+    }
+
+    #[test]
+    fn accepts_value_at_the_max_bound() {
+        assert_eq!(
+            validate_setting(ADMIN_REGEN_COOLDOWN_MINUTES_KEY, &MAX_SETTING_MINUTES.to_string()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_value_over_the_max_bound() {
+        assert!(validate_setting(
+            ADMIN_REGEN_COOLDOWN_MINUTES_KEY,
+            &(MAX_SETTING_MINUTES + 1).to_string()
+        )
+        .is_err());
     }
 }
