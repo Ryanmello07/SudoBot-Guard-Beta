@@ -395,6 +395,68 @@ async fn handle_deauth(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
 }
 
-async fn handle_status(_ctx: &Context, _pool: &PgPool, _cmd: &CommandInteraction) {
-    todo!("implemented in Task 4")
+async fn handle_status(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
+    let Some(guild_id) = cmd.guild_id else {
+        return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = cmd.user.id.get() as i64;
+
+    match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return reply_ephemeral(ctx, cmd, "You need to be a bot admin to use this command.")
+                .await
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check bot admin status");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    let sessions = match sqlx::query!(
+        "SELECT s.user_id, s.expires_at, r.permission_role_id
+         FROM sessions s
+         JOIN role_pairs r ON r.id = s.role_pair_id
+         WHERE s.guild_id = $1 AND s.revoked_at IS NULL AND s.expires_at > now()
+         ORDER BY s.expires_at",
+        guild_id_i64
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to load active sessions for status");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    };
+
+    let description = if sessions.is_empty() {
+        "No active elevated sessions.".to_string()
+    } else {
+        sessions
+            .iter()
+            .map(|s| {
+                format!(
+                    "<@{}> — <@&{}> — expires <t:{}:R>",
+                    s.user_id,
+                    s.permission_role_id,
+                    s.expires_at.timestamp()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let embed = CreateEmbed::new()
+        .title("Active elevated sessions")
+        .description(description)
+        .color(0x5865F2);
+    let msg = CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .ephemeral(true);
+    let _ = cmd
+        .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
+        .await;
 }
