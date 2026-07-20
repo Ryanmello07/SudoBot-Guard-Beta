@@ -136,8 +136,17 @@ async fn sweep_expired_sessions(http: Arc<Http>, pool: sqlx::PgPool) {
                     }
                 }
                 Err(e) => {
-                    tracing::error!(error = ?e, session_id = session.id, "expiry sweep: failed to fetch member (may have left) — marking revoked anyway since there's no role to remove");
-                    // fall through to mark revoked below — member is gone, nothing more to do
+                    let member_not_found = matches!(
+                        &e,
+                        serenity::Error::Http(http_err) if http_err.status_code() == Some(reqwest::StatusCode::NOT_FOUND)
+                    );
+                    if member_not_found {
+                        tracing::error!(error = ?e, session_id = session.id, "expiry sweep: member left the guild — marking revoked, no role to remove");
+                        // fall through to mark revoked below — member is genuinely gone
+                    } else {
+                        tracing::error!(error = ?e, session_id = session.id, "expiry sweep: failed to fetch member (transient error), will retry next tick");
+                        continue; // leave revoked_at NULL, retry next tick
+                    }
                 }
             }
 
