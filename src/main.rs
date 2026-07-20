@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod crypto;
 mod db;
+mod elevation;
 mod enrollment;
 mod logging;
 mod settings;
