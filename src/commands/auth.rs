@@ -335,8 +335,64 @@ async fn verify_yubikey(
     }
 }
 
-async fn handle_deauth(_ctx: &Context, _pool: &PgPool, _cmd: &CommandInteraction) {
-    todo!("implemented in Task 3")
+async fn handle_deauth(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
+    let Some(guild_id) = cmd.guild_id else {
+        return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = cmd.user.id.get() as i64;
+
+    let sessions = match sqlx::query!(
+        "SELECT s.id, s.role_pair_id, r.permission_role_id
+         FROM sessions s
+         JOIN role_pairs r ON r.id = s.role_pair_id
+         WHERE s.guild_id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL AND s.expires_at > now()",
+        guild_id_i64,
+        user_id_i64
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to load active sessions for deauth");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    };
+
+    if sessions.is_empty() {
+        return reply_ephemeral(ctx, cmd, "You have no active elevated sessions.").await;
+    }
+
+    let Some(member) = cmd.member.as_ref() else {
+        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+    };
+
+    let mut dropped = Vec::new();
+    for session in &sessions {
+        let permission_role_id = serenity::all::RoleId::new(session.permission_role_id as u64);
+        let _ = member.remove_role(&ctx.http, permission_role_id).await;
+
+        if let Err(e) = sqlx::query!(
+            "UPDATE sessions SET revoked_at = now(), revoke_reason = 'deauth' WHERE id = $1",
+            session.id
+        )
+        .execute(pool)
+        .await
+        {
+            tracing::error!(error = ?e, session_id = session.id, "failed to mark session revoked");
+            continue;
+        }
+        dropped.push(format!("<@&{}>", session.permission_role_id));
+    }
+
+    reply_ephemeral(ctx, cmd, &format!("Dropped: {}", dropped.join(", "))).await;
+
+    let embed = CreateEmbed::new()
+        .title("Deauthenticated")
+        .description(format!("<@{}> ended their own session(s): {}", cmd.user.id, dropped.join(", ")))
+        .color(0x5865F2);
+    let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
 }
 
 async fn handle_status(_ctx: &Context, _pool: &PgPool, _cmd: &CommandInteraction) {
