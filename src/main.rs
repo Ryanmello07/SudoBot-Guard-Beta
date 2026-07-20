@@ -11,10 +11,13 @@ mod yubico;
 
 use config::Config;
 use serenity::all::{Guild, GuildId, Interaction};
+use serenity::all::Http;
 use serenity::async_trait;
 use serenity::model::gateway::Ready;
 use serenity::prelude::*;
 use sqlx::PgPool;
+use std::sync::Arc;
+use std::time::Duration;
 
 struct Handler {
     pool: PgPool,
@@ -90,6 +93,67 @@ impl EventHandler for Handler {
     }
 }
 
+/// Runs forever, checking for expired sessions every 30 seconds and
+/// stripping the Discord role for each one found. Independent of the
+/// gateway event-handler model — this is the bot's own background clock,
+/// not triggered by anything Discord sends.
+async fn sweep_expired_sessions(http: Arc<Http>, pool: sqlx::PgPool) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        interval.tick().await;
+
+        let expired = match sqlx::query!(
+            "SELECT s.id, s.guild_id, s.user_id, r.permission_role_id
+             FROM sessions s
+             JOIN role_pairs r ON r.id = s.role_pair_id
+             WHERE s.revoked_at IS NULL AND s.expires_at <= now()"
+        )
+        .fetch_all(&pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(error = ?e, "expiry sweep: failed to query expired sessions");
+                continue;
+            }
+        };
+
+        for session in expired {
+            let guild_id = serenity::all::GuildId::new(session.guild_id as u64);
+            let user_id = serenity::all::UserId::new(session.user_id as u64);
+            let permission_role_id = serenity::all::RoleId::new(session.permission_role_id as u64);
+
+            match guild_id.member(&http, user_id).await {
+                Ok(member) => {
+                    if let Err(e) = member.remove_role(&http, permission_role_id).await {
+                        tracing::error!(error = ?e, session_id = session.id, "expiry sweep: failed to remove role");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = ?e, session_id = session.id, "expiry sweep: failed to fetch member (may have left)");
+                }
+            }
+
+            if let Err(e) = sqlx::query!(
+                "UPDATE sessions SET revoked_at = now(), revoke_reason = 'expired' WHERE id = $1",
+                session.id
+            )
+            .execute(&pool)
+            .await
+            {
+                tracing::error!(error = ?e, session_id = session.id, "expiry sweep: failed to mark session revoked");
+                continue;
+            }
+
+            let embed = serenity::all::CreateEmbed::new()
+                .title("Session expired")
+                .description(format!("<@{}>'s <@&{}> expired", session.user_id, session.permission_role_id))
+                .color(0x5865F2);
+            let _ = logging::log(&pool, &http, session.guild_id, logging::LogTier::Info, embed).await;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -116,13 +180,15 @@ async fn main() {
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MEMBERS;
     let mut client = Client::builder(&config.discord_token, intents)
         .event_handler(Handler {
-            pool,
+            pool: pool.clone(),
             initial_bot_admin_id: config.initial_bot_admin_id,
             encryption_key: config.encryption_key,
             yubico,
         })
         .await
         .expect("failed to create Discord client — check DISCORD_TOKEN");
+
+    tokio::spawn(sweep_expired_sessions(client.http.clone(), pool));
 
     if let Err(why) = client.start().await {
         tracing::error!(error = ?why, "client error");
