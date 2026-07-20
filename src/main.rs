@@ -125,15 +125,23 @@ async fn sweep_expired_sessions(http: Arc<Http>, pool: sqlx::PgPool) {
 
             match guild_id.member(&http, user_id).await {
                 Ok(member) => {
-                    if let Err(e) = member.remove_role(&http, permission_role_id).await {
-                        tracing::error!(error = ?e, session_id = session.id, "expiry sweep: failed to remove role");
+                    match member.remove_role(&http, permission_role_id).await {
+                        Ok(()) => {
+                            // fall through to mark revoked below
+                        }
+                        Err(e) => {
+                            tracing::error!(error = ?e, session_id = session.id, "expiry sweep: failed to remove role, will retry next tick");
+                            continue; // leave revoked_at NULL, retry next tick
+                        }
                     }
                 }
                 Err(e) => {
-                    tracing::error!(error = ?e, session_id = session.id, "expiry sweep: failed to fetch member (may have left)");
+                    tracing::error!(error = ?e, session_id = session.id, "expiry sweep: failed to fetch member (may have left) — marking revoked anyway since there's no role to remove");
+                    // fall through to mark revoked below — member is gone, nothing more to do
                 }
             }
 
+            // Only reached if role removal succeeded, or the member has left the guild.
             if let Err(e) = sqlx::query!(
                 "UPDATE sessions SET revoked_at = now(), revoke_reason = 'expired' WHERE id = $1",
                 session.id

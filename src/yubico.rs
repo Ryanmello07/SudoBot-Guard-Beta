@@ -36,7 +36,10 @@ impl YubicoClient {
         Self {
             client_id,
             secret_key,
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("building a reqwest client with a fixed timeout does not fail"),
         }
     }
 

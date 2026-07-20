@@ -5,7 +5,8 @@ use crate::logging::{log, LogTier};
 use crate::yubico::YubicoClient;
 use serenity::all::{
     CommandDataOptionValue, CommandInteraction, CommandOptionType, Context, CreateCommand,
-    CreateCommandOption, CreateEmbed, CreateInteractionResponse, CreateInteractionResponseMessage,
+    CreateCommandOption, CreateEmbed, CreateInteractionResponse, CreateInteractionResponseFollowup,
+    CreateInteractionResponseMessage,
 };
 use sqlx::PgPool;
 
@@ -52,6 +53,19 @@ async fn reply_ephemeral(ctx: &Context, cmd: &CommandInteraction, content: &str)
     let _ = cmd
         .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
         .await;
+}
+
+/// Like `reply_ephemeral`, but for use after the interaction has already been
+/// deferred (e.g. in `handle_auth`, which defers immediately after the
+/// lockout check to stay under Discord's 3-second ack window). Once deferred,
+/// `create_response` can no longer be used for the reply — Discord already
+/// has an initial response recorded — so every reply from that point on must
+/// go through a followup message instead.
+async fn reply_followup(ctx: &Context, cmd: &CommandInteraction, content: &str) {
+    let msg = CreateInteractionResponseFollowup::new()
+        .content(content)
+        .ephemeral(true);
+    let _ = cmd.create_followup(&ctx.http, msg).await;
 }
 
 async fn record_attempt(pool: &PgPool, guild_id_i64: i64, user_id_i64: i64, success: bool) {
@@ -108,6 +122,17 @@ async fn handle_auth(
         return reply_ephemeral(ctx, cmd, "Too many failed attempts. Try again later.").await;
     }
 
+    // Eligibility checks, code verification (possible live Yubico HTTP call),
+    // and the per-pair grant loop (role adds + session writes) below can
+    // plausibly exceed Discord's 3-second interaction ack window. Defer now
+    // so Discord shows "thinking..." instead of failing the interaction;
+    // every reply from here on must go through `reply_followup` instead of
+    // `reply_ephemeral`, since the initial response has now been sent.
+    if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = ?e, "failed to defer auth interaction");
+        return;
+    }
+
     // --- Extract options ---
     let mut code = None;
     let mut role_filter_i64: Option<i64> = None;
@@ -119,7 +144,7 @@ async fn handle_auth(
         }
     }
     let Some(code) = code else {
-        return reply_ephemeral(ctx, cmd, "Missing required code.").await;
+        return reply_followup(ctx, cmd, "Missing required code.").await;
     };
 
     // --- Eligible pairs: every pair in the guild if bot admin, else only pairs
@@ -129,7 +154,7 @@ async fn handle_auth(
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = ?e, "failed to check bot admin status");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     };
     let member_role_ids: Vec<i64> = cmd
@@ -152,7 +177,7 @@ async fn handle_auth(
         Ok(rows) => rows,
         Err(e) => {
             tracing::error!(error = ?e, "failed to load eligible role pairs");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     };
 
@@ -166,13 +191,13 @@ async fn handle_auth(
     };
 
     if pairs.is_empty() {
-        return reply_ephemeral(ctx, cmd, "You don't hold any registered role to elevate.").await;
+        return reply_followup(ctx, cmd, "You don't hold any registered role to elevate.").await;
     }
 
     // --- Verify the code ---
     let Some(shape) = elevation::detect_code_shape(&code) else {
         record_attempt(pool, guild_id_i64, user_id_i64, false).await;
-        return reply_ephemeral(ctx, cmd, "That doesn't look like a valid code.").await;
+        return reply_followup(ctx, cmd, "That doesn't look like a valid code.").await;
     };
 
     let verified = match shape {
@@ -185,20 +210,20 @@ async fn handle_auth(
         Err(e) => {
             tracing::error!(error = ?e, "error while verifying auth code");
             record_attempt(pool, guild_id_i64, user_id_i64, false).await;
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     };
 
     if !verified {
         record_attempt(pool, guild_id_i64, user_id_i64, false).await;
-        return reply_ephemeral(ctx, cmd, "That code didn't verify.").await;
+        return reply_followup(ctx, cmd, "That code didn't verify.").await;
     }
 
     record_attempt(pool, guild_id_i64, user_id_i64, true).await;
 
     // --- Grant every eligible pair independently ---
     let Some(member) = cmd.member.as_ref() else {
-        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
     };
     let mut granted_lines = Vec::new();
     let mut failed_lines = Vec::new();
@@ -211,21 +236,50 @@ async fn handle_auth(
             continue;
         }
 
-        let expires_at_result = sqlx::query!(
-            "INSERT INTO sessions (guild_id, user_id, role_pair_id, expires_at)
-             VALUES ($1, $2, $3, now() + make_interval(mins => $4))
-             RETURNING expires_at",
+        let existing = sqlx::query!(
+            "SELECT id FROM sessions WHERE guild_id = $1 AND user_id = $2 AND role_pair_id = $3 AND revoked_at IS NULL AND expires_at > now()",
             guild_id_i64,
             user_id_i64,
-            pair.id,
-            pair.session_minutes
+            pair.id
         )
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await;
 
+        // `sqlx::query!` generates a distinct anonymous record type per call
+        // site, so even though both branches only select `expires_at`, their
+        // `Record` types don't unify — map each down to the bare
+        // `DateTime<Utc>` so the match arms agree.
+        let expires_at_result: Result<chrono::DateTime<chrono::Utc>, sqlx::Error> = match existing {
+            Ok(Some(existing_row)) => {
+                sqlx::query!(
+                    "UPDATE sessions SET expires_at = now() + make_interval(mins => $1) WHERE id = $2 RETURNING expires_at",
+                    pair.session_minutes,
+                    existing_row.id
+                )
+                .fetch_one(pool)
+                .await
+                .map(|row| row.expires_at)
+            }
+            Ok(None) => {
+                sqlx::query!(
+                    "INSERT INTO sessions (guild_id, user_id, role_pair_id, expires_at)
+                     VALUES ($1, $2, $3, now() + make_interval(mins => $4))
+                     RETURNING expires_at",
+                    guild_id_i64,
+                    user_id_i64,
+                    pair.id,
+                    pair.session_minutes
+                )
+                .fetch_one(pool)
+                .await
+                .map(|row| row.expires_at)
+            }
+            Err(e) => Err(e),
+        };
+
         match expires_at_result {
-            Ok(row) => {
-                let ts = row.expires_at.timestamp();
+            Ok(expires_at) => {
+                let ts = expires_at.timestamp();
                 granted_lines.push(format!("<@&{}> — expires <t:{}:R>", pair.permission_role_id, ts));
 
                 let embed = CreateEmbed::new()
@@ -256,7 +310,7 @@ async fn handle_auth(
         content.push_str("Failed:\n");
         content.push_str(&failed_lines.join("\n"));
     }
-    reply_ephemeral(ctx, cmd, &content).await;
+    reply_followup(ctx, cmd, &content).await;
 }
 
 async fn verify_totp(
