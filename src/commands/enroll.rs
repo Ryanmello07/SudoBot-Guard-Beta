@@ -343,7 +343,9 @@ pub async fn handle_component(
 ) {
     match comp.data.custom_id.as_str() {
         "enroll_totp" => handle_totp_button(ctx, pool, encryption_key, comp, false).await,
-        "totp_verify_button" => handle_totp_verify_button(ctx, comp).await,
+        "totp_verify_button" | "totp_verify_button_then_yubikey" => {
+            handle_totp_verify_button(ctx, comp).await
+        }
         "enroll_yubikey" => handle_yubikey_button(ctx, pool, comp).await,
         "enroll_both" => handle_totp_button(ctx, pool, encryption_key, comp, true).await,
         _ => {}
@@ -558,9 +560,12 @@ async fn handle_totp_verify_button(ctx: &Context, comp: &ComponentInteraction) {
             .placeholder("6-digit code")
             .required(true),
     )]);
-    let _ = comp
+    if let Err(e) = comp
         .create_response(&ctx.http, serenity::all::CreateInteractionResponse::Modal(modal))
-        .await;
+        .await
+    {
+        tracing::error!(error = ?e, "failed to open TOTP verify modal");
+    }
 }
 
 async fn handle_yubikey_button(ctx: &Context, pool: &PgPool, comp: &ComponentInteraction) {
@@ -622,9 +627,12 @@ async fn handle_yubikey_button(ctx: &Context, pool: &PgPool, comp: &ComponentInt
                 .required(true),
         ),
     ]);
-    let _ = comp
+    if let Err(e) = comp
         .create_response(&ctx.http, serenity::all::CreateInteractionResponse::Modal(modal))
-        .await;
+        .await
+    {
+        tracing::error!(error = ?e, "failed to open YubiKey enroll modal");
+    }
 }
 
 pub async fn handle_modal(
