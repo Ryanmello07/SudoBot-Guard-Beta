@@ -19,6 +19,7 @@ struct Handler {
     pool: PgPool,
     initial_bot_admin_id: Option<u64>,
     encryption_key: [u8; 32],
+    yubico: yubico::YubicoClient,
 }
 
 impl Handler {
@@ -78,7 +79,7 @@ impl EventHandler for Handler {
                 }
             }
             Interaction::Modal(modal) => {
-                commands::enroll::handle_modal(&ctx, &self.pool, &self.encryption_key, &modal).await
+                commands::enroll::handle_modal(&ctx, &self.pool, &self.encryption_key, &self.yubico, &modal).await
             }
             _ => {}
         }
@@ -106,12 +107,15 @@ async fn main() {
         .expect("failed to run database migrations");
     tracing::info!("database connected and migrated");
 
+    let yubico = yubico::YubicoClient::new(config.yubico_client_id.clone(), &config.yubico_secret_key);
+
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MEMBERS;
     let mut client = Client::builder(&config.discord_token, intents)
         .event_handler(Handler {
             pool,
             initial_bot_admin_id: config.initial_bot_admin_id,
             encryption_key: config.encryption_key,
+            yubico,
         })
         .await
         .expect("failed to create Discord client — check DISCORD_TOKEN");

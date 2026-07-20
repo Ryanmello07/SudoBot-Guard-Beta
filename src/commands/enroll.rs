@@ -318,6 +318,7 @@ pub async fn handle_component(
     match comp.data.custom_id.as_str() {
         "enroll_totp" => handle_totp_button(ctx, pool, encryption_key, comp, false).await,
         "totp_verify_button" => handle_totp_verify_button(ctx, comp).await,
+        "enroll_yubikey" => handle_yubikey_button(ctx, pool, comp).await,
         _ => {}
     }
 }
@@ -352,7 +353,7 @@ async fn evaluate_gate(
         (row.is_some(), row.map(|r| r.enrolled_at))
     } else {
         let row = sqlx::query!(
-            "SELECT enrolled_at FROM yubikey_enrollments WHERE guild_id = $1 AND user_id = $2",
+            "SELECT enrolled_at FROM yubikey_enrollments WHERE guild_id = $1 AND user_id = $2 AND verified = true",
             guild_id_i64,
             user_id_i64
         )
@@ -535,9 +536,82 @@ async fn handle_totp_verify_button(ctx: &Context, comp: &ComponentInteraction) {
         .await;
 }
 
-pub async fn handle_modal(ctx: &Context, pool: &PgPool, encryption_key: &[u8; 32], modal: &ModalInteraction) {
+async fn handle_yubikey_button(ctx: &Context, pool: &PgPool, comp: &ComponentInteraction) {
+    let Some(guild_id) = comp.guild_id else {
+        return reply_component_ephemeral(ctx, comp, "This only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = comp.user.id.get() as i64;
+
+    let decision = match evaluate_gate(pool, guild_id_i64, user_id_i64, "yubikey").await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to evaluate enrollment gate");
+            return reply_component_ephemeral(ctx, comp, "Something went wrong. Try again later.").await;
+        }
+    };
+
+    match decision {
+        EnrollmentDecision::CooldownNotElapsed => {
+            return reply_component_ephemeral(
+                ctx,
+                comp,
+                "You've regenerated this factor too recently — try again later.",
+            )
+            .await;
+        }
+        EnrollmentDecision::NeedsApproval => {
+            let _ = sqlx::query!(
+                "INSERT INTO enrollment_requests (guild_id, user_id, factor_type, action)
+                 VALUES ($1, $2, 'yubikey', 'add')",
+                guild_id_i64,
+                user_id_i64
+            )
+            .execute(pool)
+            .await;
+            return reply_component_ephemeral(
+                ctx,
+                comp,
+                "A bot admin needs to approve this before you can enroll a YubiKey. Ask one to run /enroll approve for you.",
+            )
+            .await;
+        }
+        EnrollmentDecision::SelfServiceRegenerate | EnrollmentDecision::ApprovedRegenerate => {
+            let _ = sqlx::query!(
+                "DELETE FROM yubikey_enrollments WHERE guild_id = $1 AND user_id = $2",
+                guild_id_i64,
+                user_id_i64
+            )
+            .execute(pool)
+            .await;
+        }
+        EnrollmentDecision::SelfServiceAdd | EnrollmentDecision::ApprovedAdd => {}
+    }
+
+    let modal = CreateModal::new("yubikey_enroll_modal", "Enroll YubiKey").components(vec![
+        CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Short, "Touch your YubiKey and paste the OTP", "yubikey_otp")
+                .placeholder("cccc...")
+                .required(true),
+        ),
+    ]);
+    let _ = comp
+        .create_response(&ctx.http, serenity::all::CreateInteractionResponse::Modal(modal))
+        .await;
+}
+
+pub async fn handle_modal(
+    ctx: &Context,
+    pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &crate::yubico::YubicoClient,
+    modal: &ModalInteraction,
+) {
     if modal.data.custom_id == "totp_verify_modal" || modal.data.custom_id == "totp_verify_modal_then_yubikey" {
         handle_totp_verify_modal(ctx, pool, encryption_key, modal).await;
+    }
+    if modal.data.custom_id == "yubikey_enroll_modal" {
+        handle_yubikey_modal(ctx, pool, yubico, modal).await;
     }
 }
 
@@ -667,6 +741,84 @@ async fn handle_totp_verify_modal(
     let embed = serenity::all::CreateEmbed::new()
         .title("TOTP enrolled")
         .description(format!("<@{}> enrolled/regenerated TOTP", modal.user.id))
+        .color(0x57F287);
+    let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Info, embed).await;
+}
+
+async fn handle_yubikey_modal(
+    ctx: &Context,
+    pool: &PgPool,
+    yubico: &crate::yubico::YubicoClient,
+    modal: &ModalInteraction,
+) {
+    let Some(guild_id) = modal.guild_id else {
+        return reply_modal_ephemeral(ctx, modal, "This only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = modal.user.id.get() as i64;
+
+    let submitted_otp = modal
+        .data
+        .components
+        .iter()
+        .flat_map(|row| row.components.iter())
+        .find_map(|c| {
+            if let serenity::all::ActionRowComponent::InputText(input) = c {
+                input.value.clone()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    let result = match yubico.verify_otp(&submitted_otp).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = ?e, "Yubico verification request failed");
+            return reply_modal_ephemeral(ctx, modal, "Couldn't reach Yubico's verification service. Try again later.").await;
+        }
+    };
+
+    if !result.valid {
+        return reply_modal_ephemeral(ctx, modal, "That OTP didn't validate. Try again.").await;
+    }
+
+    if let Err(e) = sqlx::query!(
+        "INSERT INTO yubikey_enrollments (guild_id, user_id, yubikey_public_id)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (guild_id, user_id) DO UPDATE SET yubikey_public_id = EXCLUDED.yubikey_public_id, enrolled_at = now()",
+        guild_id_i64,
+        user_id_i64,
+        result.public_id
+    )
+    .execute(pool)
+    .await
+    {
+        tracing::error!(error = ?e, "failed to store YubiKey enrollment");
+        return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+    }
+
+    let _ = sqlx::query!(
+        "UPDATE enrollment_requests SET status = 'fulfilled'
+         WHERE guild_id = $1 AND user_id = $2 AND factor_type = 'yubikey' AND status = 'approved'",
+        guild_id_i64,
+        user_id_i64
+    )
+    .execute(pool)
+    .await;
+
+    let backup_codes_shown = issue_backup_codes_if_first_factor(pool, guild_id_i64, user_id_i64).await;
+
+    let mut content = "YubiKey verified and enrolled.".to_string();
+    if let Some(codes) = backup_codes_shown {
+        content.push_str("\n\nSave these one-time backup codes now — they won't be shown again:\n");
+        content.push_str(&codes.join("\n"));
+    }
+    reply_modal_ephemeral(ctx, modal, &content).await;
+
+    let embed = serenity::all::CreateEmbed::new()
+        .title("YubiKey enrolled")
+        .description(format!("<@{}> enrolled/regenerated a YubiKey", modal.user.id))
         .color(0x57F287);
     let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Info, embed).await;
 }
