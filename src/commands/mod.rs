@@ -1,3 +1,4 @@
+pub mod enroll;
 pub mod protect;
 pub mod settings;
 pub mod setup;
@@ -9,6 +10,7 @@ pub async fn register_all(ctx: &Context, guild_id: GuildId) -> serenity::Result<
         .into_iter()
         .chain(protect::commands())
         .chain(settings::commands())
+        .chain(enroll::commands())
     {
         guild_id.create_command(&ctx.http, command).await?;
     }

@@ -66,6 +66,7 @@ impl EventHandler for Handler {
                 "setup" => commands::setup::handle(&ctx, &self.pool, &cmd).await,
                 "protect" => commands::protect::handle(&ctx, &self.pool, &cmd).await,
                 "settings" => commands::settings::handle(&ctx, &self.pool, &cmd).await,
+                "enroll" => commands::enroll::handle(&ctx, &self.pool, &cmd).await,
                 _ => {}
             },
             Interaction::Component(comp) => {
