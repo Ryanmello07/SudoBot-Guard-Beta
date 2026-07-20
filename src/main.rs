@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod crypto;
 mod db;
+mod enrollment;
 mod logging;
 mod settings;
 mod yubico;
