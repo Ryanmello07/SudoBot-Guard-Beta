@@ -62,6 +62,7 @@ impl EventHandler for Handler {
         if let Interaction::Command(cmd) = interaction {
             match cmd.data.name.as_str() {
                 "setup" => commands::setup::handle(&ctx, &self.pool, &cmd).await,
+                "protect" => commands::protect::handle(&ctx, &self.pool, &cmd).await,
                 _ => {}
             }
         }

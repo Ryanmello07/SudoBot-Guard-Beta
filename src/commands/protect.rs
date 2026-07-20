@@ -1,0 +1,275 @@
+use crate::auth;
+use crate::logging::{log, LogTier};
+use serenity::all::{
+    CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType, Context,
+    CreateCommand, CreateCommandOption, CreateEmbed, CreateInteractionResponse,
+    CreateInteractionResponseMessage,
+};
+use sqlx::PgPool;
+
+pub fn commands() -> Vec<CreateCommand> {
+    vec![CreateCommand::new("protect")
+        .description("Manage protected role pairs")
+        .add_option(
+            CreateCommandOption::new(CommandOptionType::SubCommand, "add", "Register a role pair")
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::Role,
+                        "standard_role",
+                        "The staffer's identity role (zero permissions)",
+                    )
+                    .required(true),
+                )
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::Role,
+                        "permission_role",
+                        "The role with real permissions, only ever bot-granted",
+                    )
+                    .required(true),
+                )
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::Integer,
+                        "session_minutes",
+                        "How long an elevation from this pair lasts",
+                    )
+                    .required(true)
+                    .min_int_value(1)
+                    .max_int_value(i32::MAX as u64),
+                )
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "alert_tier",
+                        "Log severity for this pair's events (default: info)",
+                    )
+                    .add_string_choice("info", "info")
+                    .add_string_choice("alert", "alert"),
+                ),
+        )]
+}
+
+pub async fn handle(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
+    let Some(sub) = cmd.data.options.first() else {
+        return;
+    };
+    match sub.name.as_str() {
+        "add" => handle_add(ctx, pool, cmd, sub).await,
+        _ => {}
+    }
+}
+
+async fn reply_ephemeral(ctx: &Context, cmd: &CommandInteraction, content: &str) {
+    let msg = CreateInteractionResponseMessage::new()
+        .content(content)
+        .ephemeral(true);
+    let _ = cmd
+        .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
+        .await;
+}
+
+/// Given the bot's own top role position and a list of (role label, position)
+/// pairs being considered for registration, returns the labels of any role
+/// that sits at or above the bot's own position (meaning the bot can't
+/// manage it). Empty `Err` never occurs — a non-empty violations list is
+/// always returned on failure.
+pub fn validate_hierarchy(
+    bot_top_position: u16,
+    role_positions: &[(&str, u16)],
+) -> Result<(), Vec<String>> {
+    let violations: Vec<String> = role_positions
+        .iter()
+        .filter(|(_, pos)| *pos >= bot_top_position)
+        .map(|(label, _)| label.to_string())
+        .collect();
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub: &CommandDataOption) {
+    let Some(guild_id) = cmd.guild_id else {
+        return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = cmd.user.id.get() as i64;
+
+    match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return reply_ephemeral(ctx, cmd, "You need to be a bot admin to use this command.")
+                .await
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check bot admin status");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    let CommandDataOptionValue::SubCommand(opts) = &sub.value else {
+        return;
+    };
+
+    let mut standard_role = None;
+    let mut permission_role = None;
+    let mut session_minutes: Option<i64> = None;
+    let mut alert_tier = "info".to_string();
+    for opt in opts {
+        match (opt.name.as_str(), &opt.value) {
+            ("standard_role", CommandDataOptionValue::Role(id)) => standard_role = Some(*id),
+            ("permission_role", CommandDataOptionValue::Role(id)) => permission_role = Some(*id),
+            ("session_minutes", CommandDataOptionValue::Integer(n)) => session_minutes = Some(*n),
+            ("alert_tier", CommandDataOptionValue::String(s)) => alert_tier = s.clone(),
+            _ => {}
+        }
+    }
+    let (Some(standard_role), Some(permission_role), Some(session_minutes)) =
+        (standard_role, permission_role, session_minutes)
+    else {
+        return reply_ephemeral(ctx, cmd, "Missing required options.").await;
+    };
+
+    if standard_role == permission_role {
+        return reply_ephemeral(
+            ctx,
+            cmd,
+            "Standard role and permission role must be different.",
+        )
+        .await;
+    }
+
+    // NOT independently spiked before this plan was written — if
+    // `ctx.cache.current_user()` doesn't exist under this name/path in
+    // serenity 0.12.5, investigate the real API rather than guessing.
+    let Some(guild) = ctx.cache.guild(guild_id).map(|g| g.clone()) else {
+        return reply_ephemeral(
+            ctx,
+            cmd,
+            "Couldn't read this server's roles right now, try again in a moment.",
+        )
+        .await;
+    };
+    let Some(bot_member) = guild.members.get(&ctx.cache.current_user().id) else {
+        return reply_ephemeral(
+            ctx,
+            cmd,
+            "Couldn't verify the bot's own role position, try again in a moment.",
+        )
+        .await;
+    };
+    let bot_top_position = bot_member
+        .roles
+        .iter()
+        .filter_map(|r| guild.roles.get(r))
+        .map(|r| r.position)
+        .max()
+        .unwrap_or(0);
+
+    let role_positions: Vec<(&str, u16)> = vec![
+        (
+            "standard role",
+            guild
+                .roles
+                .get(&standard_role)
+                .map(|r| r.position)
+                .unwrap_or(u16::MAX),
+        ),
+        (
+            "permission role",
+            guild
+                .roles
+                .get(&permission_role)
+                .map(|r| r.position)
+                .unwrap_or(u16::MAX),
+        ),
+    ];
+    if let Err(violations) = validate_hierarchy(bot_top_position, &role_positions) {
+        return reply_ephemeral(
+            ctx,
+            cmd,
+            &format!(
+                "These roles sit at or above the bot's own role, so it can't manage them: {}",
+                violations.join(", ")
+            ),
+        )
+        .await;
+    }
+
+    let Ok(session_minutes_i32) = i32::try_from(session_minutes) else {
+        return reply_ephemeral(ctx, cmd, "Session length is out of range.").await;
+    };
+
+    if let Err(e) = sqlx::query!(
+        "INSERT INTO role_pairs (guild_id, standard_role_id, permission_role_id, session_minutes, alert_tier, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+        guild_id_i64,
+        standard_role.get() as i64,
+        permission_role.get() as i64,
+        session_minutes_i32,
+        alert_tier,
+        user_id_i64
+    )
+    .execute(pool)
+    .await
+    {
+        tracing::error!(error = ?e, "failed to insert role pair");
+        return reply_ephemeral(
+            ctx,
+            cmd,
+            "Couldn't register that pair — it may already be registered, or something went wrong.",
+        )
+        .await;
+    }
+
+    reply_ephemeral(ctx, cmd, "Role pair registered.").await;
+
+    let embed = CreateEmbed::new()
+        .title("Role pair registered")
+        .description(format!(
+            "<@{}> registered <@&{}> \u{2192} <@&{}> ({} min, {} tier)",
+            cmd.user.id, standard_role, permission_role, session_minutes, alert_tier
+        ))
+        .color(0x57F287);
+    let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_roles_strictly_below_bot() {
+        let result = validate_hierarchy(10, &[("standard role", 3), ("permission role", 5)]);
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn rejects_role_equal_to_bot_position() {
+        let result = validate_hierarchy(10, &[("standard role", 10)]);
+        assert_eq!(result, Err(vec!["standard role".to_string()]));
+    }
+
+    #[test]
+    fn rejects_role_above_bot_position() {
+        let result = validate_hierarchy(10, &[("permission role", 15)]);
+        assert_eq!(result, Err(vec!["permission role".to_string()]));
+    }
+
+    #[test]
+    fn reports_all_violating_roles_not_just_the_first() {
+        let result = validate_hierarchy(10, &[("standard role", 12), ("permission role", 20)]);
+        assert_eq!(
+            result,
+            Err(vec!["standard role".to_string(), "permission role".to_string()])
+        );
+    }
+
+    #[test]
+    fn mixed_valid_and_invalid_only_reports_invalid() {
+        let result = validate_hierarchy(10, &[("standard role", 3), ("permission role", 10)]);
+        assert_eq!(result, Err(vec!["permission role".to_string()]));
+    }
+}
