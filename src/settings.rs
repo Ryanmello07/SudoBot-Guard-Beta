@@ -3,26 +3,48 @@ use sqlx::PgPool;
 pub const ADMIN_REGEN_COOLDOWN_MINUTES_KEY: &str = "admin_regen_cooldown_minutes";
 pub const ADMIN_REGEN_COOLDOWN_MINUTES_DEFAULT: i64 = 1440;
 
-/// All keys `/settings set` will accept. Add new entries here as the bot
-/// grows more configurable rules.
-pub const KNOWN_KEYS: &[&str] = &[ADMIN_REGEN_COOLDOWN_MINUTES_KEY];
+pub const ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_KEY: &str = "admin_regen_completion_window_minutes";
+pub const ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_DEFAULT: i64 = 1440;
 
+/// A single configurable, integer-valued (minutes) server setting: its
+/// storage key, a human-readable description shown in `/settings view`, and
+/// its default when unset. Add new entries here as the bot grows more
+/// configurable rules — `/settings view`, `/settings set`'s choices, and
+/// validation should all derive from this one list rather than duplicating
+/// per-key logic elsewhere.
+pub struct SettingDefinition {
+    pub key: &'static str,
+    pub description: &'static str,
+    pub default: i64,
+}
+
+pub const SETTINGS_REGISTRY: &[SettingDefinition] = &[
+    SettingDefinition {
+        key: ADMIN_REGEN_COOLDOWN_MINUTES_KEY,
+        description: "How long a bot admin must wait after requesting a factor regenerate before they're allowed to complete it.",
+        default: ADMIN_REGEN_COOLDOWN_MINUTES_DEFAULT,
+    },
+    SettingDefinition {
+        key: ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_KEY,
+        description: "Once the cooldown above has passed, how long the admin has to actually complete the regenerate before the request expires and they have to start over.",
+        default: ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_DEFAULT,
+    },
+];
+
+/// All settings currently take a positive integer number of minutes, so
+/// validation is uniform across the whole registry — no per-key match
+/// needed unless a future setting has different rules.
 pub fn validate_setting(key: &str, value: &str) -> Result<(), String> {
-    if !KNOWN_KEYS.contains(&key) {
+    if !SETTINGS_REGISTRY.iter().any(|s| s.key == key) {
         return Err(format!("unknown setting: {key}"));
     }
-    match key {
-        ADMIN_REGEN_COOLDOWN_MINUTES_KEY => {
-            let n: i64 = value
-                .parse()
-                .map_err(|_| "must be a positive integer (minutes)".to_string())?;
-            if n <= 0 {
-                return Err("must be positive".to_string());
-            }
-            Ok(())
-        }
-        _ => unreachable!("KNOWN_KEYS check above already rejected unknown keys"),
+    let n: i64 = value
+        .parse()
+        .map_err(|_| "must be a positive integer (minutes)".to_string())?;
+    if n <= 0 {
+        return Err("must be positive".to_string());
     }
+    Ok(())
 }
 
 pub async fn get_int_setting(
@@ -95,5 +117,25 @@ mod tests {
     #[test]
     fn rejects_unknown_key() {
         assert!(validate_setting("not_a_real_setting", "123").is_err());
+    }
+
+    #[test]
+    fn accepts_valid_completion_window_value() {
+        assert_eq!(
+            validate_setting(ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_KEY, "1440"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rejects_zero_completion_window() {
+        assert!(validate_setting(ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_KEY, "0").is_err());
+    }
+
+    #[test]
+    fn registry_contains_both_keys() {
+        let keys: Vec<&str> = SETTINGS_REGISTRY.iter().map(|s| s.key).collect();
+        assert!(keys.contains(&ADMIN_REGEN_COOLDOWN_MINUTES_KEY));
+        assert!(keys.contains(&ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_KEY));
     }
 }

@@ -399,16 +399,26 @@ async fn evaluate_gate(
             settings::ADMIN_REGEN_COOLDOWN_MINUTES_DEFAULT,
         )
         .await?;
+        let completion_window_minutes = settings::get_int_setting(
+            pool,
+            guild_id_i64,
+            settings::ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_KEY,
+            settings::ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_DEFAULT,
+        )
+        .await?;
 
         // Anchor the admin's own regenerate cooldown to when they first
-        // requested it (auto-approved instantly, since admins don't need
-        // anyone else's approval), not to the factor's original enrolled_at
-        // — this is the delay the user asked for: request now, complete
-        // only after the cooldown window has passed since that request.
+        // requested it, and only while the request is still within its
+        // completion window (cooldown + completion_window from the request
+        // time) -- once that window passes with no completion, the request
+        // is treated as expired and a fresh click starts an entirely new
+        // cooldown, so an approved-but-abandoned request doesn't stay valid
+        // forever.
         let existing_request = sqlx::query!(
             "SELECT requested_at FROM enrollment_requests
              WHERE guild_id = $1 AND user_id = $2 AND factor_type = $3
                AND action = 'regenerate' AND status = 'approved'
+               AND window_expires_at > now()
              ORDER BY requested_at DESC LIMIT 1",
             guild_id_i64,
             user_id_i64,
@@ -420,12 +430,32 @@ async fn evaluate_gate(
         match existing_request {
             Some(row) => enrollment::cooldown_elapsed(row.requested_at, chrono::Utc::now(), cooldown_minutes),
             None => {
+                // Any earlier request for this (guild, user, factor,
+                // regenerate) that's now past its own window is stale --
+                // mark it explicitly expired rather than leaving it looking
+                // like a live 'approved' row forever.
                 sqlx::query!(
-                    "INSERT INTO enrollment_requests (guild_id, user_id, factor_type, action, status, approved_by, approved_at)
-                     VALUES ($1, $2, $3, 'regenerate', 'approved', $2, now())",
+                    "UPDATE enrollment_requests SET status = 'expired'
+                     WHERE guild_id = $1 AND user_id = $2 AND factor_type = $3
+                       AND action = 'regenerate' AND status = 'approved'
+                       AND window_expires_at <= now()",
                     guild_id_i64,
                     user_id_i64,
                     factor
+                )
+                .execute(pool)
+                .await?;
+
+                let total_minutes = cooldown_minutes + completion_window_minutes;
+                sqlx::query!(
+                    "INSERT INTO enrollment_requests
+                        (guild_id, user_id, factor_type, action, status, approved_by, approved_at, window_minutes, window_expires_at)
+                     VALUES ($1, $2, $3, 'regenerate', 'approved', $2, now(), $4, now() + make_interval(mins => $5))",
+                    guild_id_i64,
+                    user_id_i64,
+                    factor,
+                    completion_window_minutes as i32,
+                    total_minutes as i32
                 )
                 .execute(pool)
                 .await?;
@@ -464,6 +494,7 @@ async fn cooldown_wait_message(pool: &PgPool, guild_id_i64: i64, user_id_i64: i6
         "SELECT requested_at FROM enrollment_requests
          WHERE guild_id = $1 AND user_id = $2 AND factor_type = $3
            AND action = 'regenerate' AND status = 'approved'
+           AND window_expires_at > now()
          ORDER BY requested_at DESC LIMIT 1",
         guild_id_i64,
         user_id_i64,

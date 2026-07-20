@@ -1,6 +1,6 @@
 use crate::auth;
 use crate::logging::{log, LogTier};
-use crate::settings::{self, ADMIN_REGEN_COOLDOWN_MINUTES_DEFAULT, ADMIN_REGEN_COOLDOWN_MINUTES_KEY};
+use crate::settings::{self, ADMIN_REGEN_COOLDOWN_MINUTES_KEY};
 use serenity::all::{
     CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType, Context,
     CreateCommand, CreateCommandOption, CreateEmbed, CreateInteractionResponse,
@@ -28,6 +28,10 @@ pub fn commands() -> Vec<CreateCommand> {
                     .add_string_choice(
                         "admin_regen_cooldown_minutes",
                         ADMIN_REGEN_COOLDOWN_MINUTES_KEY,
+                    )
+                    .add_string_choice(
+                        "admin_regen_completion_window_minutes",
+                        crate::settings::ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_KEY,
                     ),
                 )
                 .add_sub_option(
@@ -80,27 +84,26 @@ async fn handle_view(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
         }
     }
 
-    let cooldown = match settings::get_int_setting(
-        pool,
-        guild_id_i64,
-        ADMIN_REGEN_COOLDOWN_MINUTES_KEY,
-        ADMIN_REGEN_COOLDOWN_MINUTES_DEFAULT,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(error = ?e, "failed to read settings");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
-        }
-    };
-
-    let embed = CreateEmbed::new()
+    let mut embed = CreateEmbed::new()
         .title("Server settings")
-        .description(format!(
-            "**{ADMIN_REGEN_COOLDOWN_MINUTES_KEY}**: {cooldown} minutes"
-        ))
+        .description("Rules and cooldowns for this server. Change any of these with `/settings set`.")
         .color(0x5865F2);
+
+    for def in settings::SETTINGS_REGISTRY {
+        let value = match settings::get_int_setting(pool, guild_id_i64, def.key, def.default).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = ?e, key = def.key, "failed to read setting");
+                return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            }
+        };
+        embed = embed.field(
+            def.key,
+            format!("**{value} minutes** (default: {})\n{}", def.default, def.description),
+            false,
+        );
+    }
+
     let msg = CreateInteractionResponseMessage::new()
         .embed(embed)
         .ephemeral(true);
