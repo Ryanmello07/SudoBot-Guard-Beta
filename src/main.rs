@@ -64,6 +64,7 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) => match cmd.data.name.as_str() {
                 "setup" => commands::setup::handle(&ctx, &self.pool, &cmd).await,
                 "protect" => commands::protect::handle(&ctx, &self.pool, &cmd).await,
+                "settings" => commands::settings::handle(&ctx, &self.pool, &cmd).await,
                 _ => {}
             },
             Interaction::Component(comp) => {
