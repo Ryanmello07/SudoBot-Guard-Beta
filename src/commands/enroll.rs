@@ -199,6 +199,32 @@ async fn handle_approve(
     };
 
     let target_user_i64 = target_user.get() as i64;
+
+    // Bot admins self-serve entirely (Task 5/6 design): the admin regen
+    // cooldown is the ONLY rate-limit on them regenerating an existing
+    // factor, and that cooldown is only consulted by evaluate_gate's
+    // SelfServiceRegenerate path. Approving a bot admin here would insert an
+    // already-'approved' request and (for regenerate) delete their existing
+    // verified factor outright, which then makes evaluate_gate see no
+    // verified factor and return SelfServiceAdd — bypassing the cooldown
+    // entirely. Block on the target (not just the caller) before any DB
+    // writes so neither self-approval nor cross-admin-reset can happen.
+    match auth::is_bot_admin(pool, guild_id_i64, target_user_i64).await {
+        Ok(true) => {
+            return reply_ephemeral(
+                ctx,
+                cmd,
+                "Bot admins don't need approval — they can enroll directly via /enroll start.",
+            )
+            .await;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check target's bot admin status");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
     let action = match determine_regenerate_or_add(pool, guild_id_i64, target_user_i64, &factor).await {
         Ok(action) => action,
         Err(e) => {
