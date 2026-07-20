@@ -319,6 +319,7 @@ pub async fn handle_component(
         "enroll_totp" => handle_totp_button(ctx, pool, encryption_key, comp, false).await,
         "totp_verify_button" => handle_totp_verify_button(ctx, comp).await,
         "enroll_yubikey" => handle_yubikey_button(ctx, pool, comp).await,
+        "enroll_both" => handle_totp_button(ctx, pool, encryption_key, comp, true).await,
         _ => {}
     }
 }
