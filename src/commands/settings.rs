@@ -2,11 +2,16 @@ use crate::auth;
 use crate::logging::{log, LogTier};
 use crate::settings::{self, ADMIN_REGEN_COOLDOWN_MINUTES_KEY};
 use serenity::all::{
-    CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType, Context,
-    CreateCommand, CreateCommandOption, CreateEmbed, CreateInteractionResponse,
-    CreateInteractionResponseMessage,
+    ActionRowComponent, CommandDataOption, CommandDataOptionValue, CommandInteraction,
+    CommandOptionType, ComponentInteraction, ComponentInteractionDataKind, Context, CreateActionRow,
+    CreateCommand, CreateCommandOption, CreateEmbed, CreateInputText, CreateInteractionResponse,
+    CreateInteractionResponseMessage, CreateModal, CreateSelectMenu, CreateSelectMenuKind,
+    CreateSelectMenuOption, InputTextStyle, ModalInteraction,
 };
 use sqlx::PgPool;
+
+const SETTINGS_SELECT_ID: &str = "settings_select";
+const SETTINGS_MODAL_PREFIX: &str = "settings_modal:";
 
 pub fn commands() -> Vec<CreateCommand> {
     vec![CreateCommand::new("settings")
@@ -104,12 +109,31 @@ async fn handle_view(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
         );
     }
 
+    let select = CreateActionRow::SelectMenu(
+        CreateSelectMenu::new(SETTINGS_SELECT_ID, settings_select_kind())
+            .placeholder("Change a setting"),
+    );
+
     let msg = CreateInteractionResponseMessage::new()
         .embed(embed)
+        .components(vec![select])
         .ephemeral(true);
     let _ = cmd
         .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
         .await;
+}
+
+/// Builds the select menu's options from the registry so the dropdown stays
+/// in sync with `/settings set`'s choices without separate upkeep.
+fn settings_select_kind() -> CreateSelectMenuKind {
+    let options: Vec<CreateSelectMenuOption> = settings::SETTINGS_REGISTRY
+        .iter()
+        .map(|def| {
+            let description: String = def.description.chars().take(100).collect();
+            CreateSelectMenuOption::new(def.key, def.key).description(description)
+        })
+        .collect();
+    CreateSelectMenuKind::String { options }
 }
 
 async fn handle_set(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub: &CommandDataOption) {
@@ -161,6 +185,139 @@ async fn handle_set(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
     let embed = CreateEmbed::new()
         .title("Setting changed")
         .description(format!("<@{}> set `{key}` = `{value}`", cmd.user.id))
+        .color(0x5865F2);
+    let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
+}
+
+async fn reply_component_ephemeral(ctx: &Context, comp: &ComponentInteraction, content: &str) {
+    let msg = CreateInteractionResponseMessage::new()
+        .content(content)
+        .ephemeral(true);
+    let _ = comp
+        .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
+        .await;
+}
+
+/// Handles the `/settings view` dropdown: opens a modal pre-filled with the
+/// chosen setting's current value. The modal submit (`handle_modal`) does
+/// the actual validate-and-save, re-checking bot admin itself, so this step
+/// only needs to check admin to avoid showing the modal to a non-admin at all.
+pub async fn handle_component(ctx: &Context, pool: &PgPool, comp: &ComponentInteraction) {
+    if comp.data.custom_id != SETTINGS_SELECT_ID {
+        return;
+    }
+    let ComponentInteractionDataKind::StringSelect { values } = &comp.data.kind else {
+        return;
+    };
+    let Some(key) = values.first().cloned() else {
+        return;
+    };
+    let Some(guild_id) = comp.guild_id else {
+        return reply_component_ephemeral(ctx, comp, "This only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = comp.user.id.get() as i64;
+
+    match require_bot_admin(pool, guild_id_i64, user_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return reply_component_ephemeral(ctx, comp, "You need to be a bot admin to use this.").await
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check bot admin status");
+            return reply_component_ephemeral(ctx, comp, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    let Some(def) = settings::SETTINGS_REGISTRY.iter().find(|d| d.key == key) else {
+        return reply_component_ephemeral(ctx, comp, "Unknown setting.").await;
+    };
+    let current = match settings::get_int_setting(pool, guild_id_i64, def.key, def.default).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = ?e, key = def.key, "failed to read setting");
+            return reply_component_ephemeral(ctx, comp, "Something went wrong. Try again later.").await;
+        }
+    };
+
+    let title: String = format!("Set {key}").chars().take(45).collect();
+    let modal = CreateModal::new(format!("{SETTINGS_MODAL_PREFIX}{key}"), title).components(vec![
+        CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Short, "New value (minutes)", "value")
+                .value(current.to_string())
+                .required(true),
+        ),
+    ]);
+    if let Err(e) = comp
+        .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+        .await
+    {
+        tracing::error!(error = ?e, "failed to open settings modal");
+    }
+}
+
+async fn reply_modal_ephemeral(ctx: &Context, modal: &ModalInteraction, content: &str) {
+    let msg = CreateInteractionResponseMessage::new()
+        .content(content)
+        .ephemeral(true);
+    let _ = modal
+        .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
+        .await;
+}
+
+pub async fn handle_modal(ctx: &Context, pool: &PgPool, modal: &ModalInteraction) {
+    let Some(key) = modal.data.custom_id.strip_prefix(SETTINGS_MODAL_PREFIX) else {
+        return;
+    };
+    let key = key.to_string();
+
+    let Some(guild_id) = modal.guild_id else {
+        return reply_modal_ephemeral(ctx, modal, "This only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = modal.user.id.get() as i64;
+
+    // Re-check admin here rather than trusting the check done before the
+    // modal was opened — a demoted admin could otherwise still submit it.
+    match require_bot_admin(pool, guild_id_i64, user_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return reply_modal_ephemeral(ctx, modal, "You need to be a bot admin to use this.").await
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check bot admin status");
+            return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    let mut value = None;
+    for row in &modal.data.components {
+        for c in &row.components {
+            if let ActionRowComponent::InputText(input) = c {
+                if input.custom_id == "value" {
+                    value = input.value.clone();
+                }
+            }
+        }
+    }
+    let Some(value) = value else {
+        return reply_modal_ephemeral(ctx, modal, "Missing value.").await;
+    };
+
+    if let Err(msg) = settings::validate_setting(&key, &value) {
+        return reply_modal_ephemeral(ctx, modal, &msg).await;
+    }
+
+    if let Err(e) = settings::set_setting(pool, guild_id_i64, &key, &value, user_id_i64).await {
+        tracing::error!(error = ?e, "failed to set setting");
+        return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+    }
+
+    reply_modal_ephemeral(ctx, modal, &format!("Set {key} = {value}.")).await;
+
+    let embed = CreateEmbed::new()
+        .title("Setting changed")
+        .description(format!("<@{}> set `{key}` = `{value}`", modal.user.id))
         .color(0x5865F2);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
 }

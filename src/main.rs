@@ -81,12 +81,18 @@ impl EventHandler for Handler {
             Interaction::Component(comp) => {
                 if comp.data.custom_id == "protect_remove_select" {
                     commands::protect::handle_component(&ctx, &self.pool, &comp).await;
+                } else if comp.data.custom_id == "settings_select" {
+                    commands::settings::handle_component(&ctx, &self.pool, &comp).await;
                 } else {
                     commands::enroll::handle_component(&ctx, &self.pool, &self.encryption_key, &comp).await;
                 }
             }
             Interaction::Modal(modal) => {
-                commands::enroll::handle_modal(&ctx, &self.pool, &self.encryption_key, &self.yubico, &modal).await
+                if modal.data.custom_id.starts_with("settings_modal:") {
+                    commands::settings::handle_modal(&ctx, &self.pool, &modal).await;
+                } else {
+                    commands::enroll::handle_modal(&ctx, &self.pool, &self.encryption_key, &self.yubico, &modal).await
+                }
             }
             _ => {}
         }
