@@ -18,6 +18,7 @@ use sqlx::PgPool;
 struct Handler {
     pool: PgPool,
     initial_bot_admin_id: Option<u64>,
+    encryption_key: [u8; 32],
 }
 
 impl Handler {
@@ -70,7 +71,14 @@ impl EventHandler for Handler {
                 _ => {}
             },
             Interaction::Component(comp) => {
-                commands::protect::handle_component(&ctx, &self.pool, &comp).await
+                if comp.data.custom_id == "protect_remove_select" {
+                    commands::protect::handle_component(&ctx, &self.pool, &comp).await;
+                } else {
+                    commands::enroll::handle_component(&ctx, &self.pool, &self.encryption_key, &comp).await;
+                }
+            }
+            Interaction::Modal(modal) => {
+                commands::enroll::handle_modal(&ctx, &self.pool, &self.encryption_key, &modal).await
             }
             _ => {}
         }
@@ -103,6 +111,7 @@ async fn main() {
         .event_handler(Handler {
             pool,
             initial_bot_admin_id: config.initial_bot_admin_id,
+            encryption_key: config.encryption_key,
         })
         .await
         .expect("failed to create Discord client — check DISCORD_TOKEN");
