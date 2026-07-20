@@ -7,7 +7,7 @@ mod logging;
 mod yubico;
 
 use config::Config;
-use serenity::all::{Guild, Interaction};
+use serenity::all::{Guild, GuildId, Interaction};
 use serenity::async_trait;
 use serenity::model::gateway::Ready;
 use serenity::prelude::*;
@@ -18,27 +18,44 @@ struct Handler {
     initial_bot_admin_id: Option<u64>,
 }
 
-#[async_trait]
-impl EventHandler for Handler {
-    async fn ready(&self, _ctx: Context, ready: Ready) {
-        tracing::info!(bot_name = %ready.user.name, "connected and ready");
-    }
-
-    async fn guild_create(&self, ctx: Context, guild: Guild, _is_new: Option<bool>) {
-        if let Err(e) = commands::register_all(&ctx, guild.id).await {
-            tracing::error!(error = ?e, guild_id = %guild.id, "failed to register commands");
+impl Handler {
+    /// Registers this guild's commands and bootstraps its admin if needed.
+    /// Called both from `ready` (for guilds the bot is already in — the
+    /// gateway does not reliably deliver a `guild_create` event for these
+    /// on every connection, so `ready.guilds` is the dependable source) and
+    /// from `guild_create` (for guilds joined while already connected).
+    async fn setup_guild(&self, ctx: &Context, guild_id: GuildId) {
+        if let Err(e) = commands::register_all(ctx, guild_id).await {
+            tracing::error!(error = ?e, %guild_id, "failed to register commands");
+            return;
         }
+        tracing::info!(%guild_id, "registered commands");
 
         let initial_admin_id_i64 = self.initial_bot_admin_id.map(|id| id as i64);
-        if let Err(e) = auth::bootstrap_admin_if_needed(
-            &self.pool,
-            guild.id.get() as i64,
-            initial_admin_id_i64,
-        )
-        .await
+        if let Err(e) =
+            auth::bootstrap_admin_if_needed(&self.pool, guild_id.get() as i64, initial_admin_id_i64)
+                .await
         {
-            tracing::error!(error = ?e, guild_id = %guild.id, "failed to bootstrap admin");
+            tracing::error!(error = ?e, %guild_id, "failed to bootstrap admin");
         }
+    }
+}
+
+#[async_trait]
+impl EventHandler for Handler {
+    async fn ready(&self, ctx: Context, ready: Ready) {
+        tracing::info!(bot_name = %ready.user.name, "connected and ready");
+        for guild in &ready.guilds {
+            self.setup_guild(&ctx, guild.id).await;
+        }
+    }
+
+    async fn guild_create(&self, ctx: Context, guild: Guild, is_new: Option<bool>) {
+        if is_new != Some(true) {
+            // Already covered by the ready handler's ready.guilds loop.
+            return;
+        }
+        self.setup_guild(&ctx, guild.id).await;
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
