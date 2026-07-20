@@ -59,12 +59,16 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::Command(cmd) = interaction {
-            match cmd.data.name.as_str() {
+        match interaction {
+            Interaction::Command(cmd) => match cmd.data.name.as_str() {
                 "setup" => commands::setup::handle(&ctx, &self.pool, &cmd).await,
                 "protect" => commands::protect::handle(&ctx, &self.pool, &cmd).await,
                 _ => {}
+            },
+            Interaction::Component(comp) => {
+                commands::protect::handle_component(&ctx, &self.pool, &comp).await
             }
+            _ => {}
         }
     }
 }

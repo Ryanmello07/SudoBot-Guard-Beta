@@ -1,9 +1,10 @@
 use crate::auth;
 use crate::logging::{log, LogTier};
 use serenity::all::{
-    CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType, Context,
-    CreateCommand, CreateCommandOption, CreateEmbed, CreateInteractionResponse,
-    CreateInteractionResponseMessage,
+    CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType,
+    ComponentInteraction, Context, CreateActionRow, CreateCommand, CreateCommandOption,
+    CreateEmbed, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu,
+    CreateSelectMenuKind, CreateSelectMenuOption,
 };
 use sqlx::PgPool;
 
@@ -47,7 +48,17 @@ pub fn commands() -> Vec<CreateCommand> {
                     .add_string_choice("info", "info")
                     .add_string_choice("alert", "alert"),
                 ),
-        )]
+        )
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "remove",
+            "Remove a registered role pair",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "list",
+            "List registered role pairs",
+        ))]
 }
 
 pub async fn handle(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
@@ -56,6 +67,8 @@ pub async fn handle(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
     };
     match sub.name.as_str() {
         "add" => handle_add(ctx, pool, cmd, sub).await,
+        "remove" => handle_remove(ctx, pool, cmd).await,
+        "list" => handle_list(ctx, pool, cmd).await,
         _ => {}
     }
 }
@@ -236,9 +249,227 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
 }
 
+pub fn format_pair_label(standard_role_name: &str, permission_role_name: &str) -> String {
+    format!("{standard_role_name} \u{2192} {permission_role_name}")
+}
+
+async fn handle_remove(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
+    let Some(guild_id) = cmd.guild_id else {
+        return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = cmd.user.id.get() as i64;
+
+    match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return reply_ephemeral(ctx, cmd, "You need to be a bot admin to use this command.")
+                .await
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check bot admin status");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    let rows = match sqlx::query!(
+        "SELECT id, standard_role_id, permission_role_id FROM role_pairs WHERE guild_id = $1 ORDER BY id",
+        guild_id_i64
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to list role pairs");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    };
+
+    if rows.is_empty() {
+        return reply_ephemeral(ctx, cmd, "No role pairs are registered yet.").await;
+    }
+
+    let options: Vec<CreateSelectMenuOption> = rows
+        .iter()
+        .map(|row| {
+            let label = format_pair_label(
+                &format!("<@&{}>", row.standard_role_id),
+                &format!("<@&{}>", row.permission_role_id),
+            );
+            CreateSelectMenuOption::new(label, row.id.to_string())
+        })
+        .collect();
+
+    let select = CreateActionRow::SelectMenu(
+        CreateSelectMenu::new(
+            "protect_remove_select",
+            CreateSelectMenuKind::String { options },
+        )
+        .placeholder("Choose a role pair to remove"),
+    );
+
+    let msg = CreateInteractionResponseMessage::new()
+        .content("Choose a role pair to remove:")
+        .components(vec![select])
+        .ephemeral(true);
+    let _ = cmd
+        .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
+        .await;
+}
+
+async fn handle_list(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
+    let Some(guild_id) = cmd.guild_id else {
+        return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = cmd.user.id.get() as i64;
+
+    match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return reply_ephemeral(ctx, cmd, "You need to be a bot admin to use this command.")
+                .await
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check bot admin status");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    let rows = match sqlx::query!(
+        "SELECT standard_role_id, permission_role_id, session_minutes, alert_tier FROM role_pairs WHERE guild_id = $1 ORDER BY id",
+        guild_id_i64
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to list role pairs");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    };
+
+    let description = if rows.is_empty() {
+        "No role pairs are registered yet.".to_string()
+    } else {
+        rows.iter()
+            .map(|row| {
+                format!(
+                    "<@&{}> \u{2192} <@&{}> — {} min, {} tier",
+                    row.standard_role_id, row.permission_role_id, row.session_minutes, row.alert_tier
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let embed = CreateEmbed::new()
+        .title("Registered role pairs")
+        .description(description)
+        .color(0x5865F2);
+    let msg = CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .ephemeral(true);
+    let _ = cmd
+        .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
+        .await;
+}
+
+pub async fn handle_component(ctx: &Context, pool: &PgPool, comp: &ComponentInteraction) {
+    if comp.data.custom_id != "protect_remove_select" {
+        return;
+    }
+    let serenity::all::ComponentInteractionDataKind::StringSelect { values } = &comp.data.kind
+    else {
+        return;
+    };
+    let Some(selected_id) = values.first().and_then(|v| v.parse::<i64>().ok()) else {
+        return;
+    };
+
+    let Some(guild_id) = comp.guild_id else {
+        return;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = comp.user.id.get() as i64;
+
+    match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let msg = CreateInteractionResponseMessage::new()
+                .content("You need to be a bot admin to use this command.")
+                .components(vec![])
+                .ephemeral(true);
+            let _ = comp
+                .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(msg))
+                .await;
+            return;
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check bot admin status");
+            let msg = CreateInteractionResponseMessage::new()
+                .content("Something went wrong. Try again later.")
+                .components(vec![])
+                .ephemeral(true);
+            let _ = comp
+                .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(msg))
+                .await;
+            return;
+        }
+    }
+
+    let deleted = sqlx::query!(
+        "DELETE FROM role_pairs WHERE id = $1 AND guild_id = $2 RETURNING standard_role_id, permission_role_id",
+        selected_id,
+        guild_id_i64
+    )
+    .fetch_optional(pool)
+    .await;
+
+    let msg = match deleted {
+        Ok(Some(row)) => {
+            let embed = CreateEmbed::new()
+                .title("Role pair removed")
+                .description(format!(
+                    "<@{}> removed <@&{}> \u{2192} <@&{}>",
+                    comp.user.id, row.standard_role_id, row.permission_role_id
+                ))
+                .color(0xED4245);
+            let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
+            CreateInteractionResponseMessage::new()
+                .content("Role pair removed.")
+                .components(vec![])
+                .ephemeral(true)
+        }
+        Ok(None) => CreateInteractionResponseMessage::new()
+            .content("That pair no longer exists.")
+            .components(vec![])
+            .ephemeral(true),
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to delete role pair");
+            CreateInteractionResponseMessage::new()
+                .content("Something went wrong. Try again later.")
+                .components(vec![])
+                .ephemeral(true)
+        }
+    };
+
+    let _ = comp
+        .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(msg))
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_pair_label_with_arrow() {
+        let label = format_pair_label("Moderator", "Moderator (Elevated)");
+        assert_eq!(label, "Moderator \u{2192} Moderator (Elevated)");
+    }
 
     #[test]
     fn accepts_roles_strictly_below_bot() {
