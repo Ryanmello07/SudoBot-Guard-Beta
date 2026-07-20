@@ -4,7 +4,7 @@ use serenity::all::{
     CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType,
     ComponentInteraction, Context, CreateActionRow, CreateCommand, CreateCommandOption,
     CreateEmbed, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu,
-    CreateSelectMenuKind, CreateSelectMenuOption,
+    CreateSelectMenuKind, CreateSelectMenuOption, RoleId,
 };
 use sqlx::PgPool;
 
@@ -290,16 +290,43 @@ async fn handle_remove(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
         return reply_ephemeral(ctx, cmd, "No role pairs are registered yet.").await;
     }
 
-    let options: Vec<CreateSelectMenuOption> = rows
+    // Resolve role names from cache so labels are readable — select-menu
+    // option labels don't render Discord mention syntax, unlike message
+    // content. Fall back to the raw mention format per-role (or for every
+    // row, if the guild isn't cached) rather than blocking removal.
+    let guild = ctx.cache.guild(guild_id).map(|g| g.clone());
+    let resolve_name = |role_id: i64| -> String {
+        let fallback = || format!("<@&{role_id}>");
+        guild
+            .as_ref()
+            .and_then(|g| g.roles.get(&RoleId::new(role_id as u64)))
+            .map(|r| r.name.clone())
+            .unwrap_or_else(fallback)
+    };
+
+    let total = rows.len();
+    let shown: Vec<_> = rows.iter().take(25).collect();
+    let options: Vec<CreateSelectMenuOption> = shown
         .iter()
         .map(|row| {
             let label = format_pair_label(
-                &format!("<@&{}>", row.standard_role_id),
-                &format!("<@&{}>", row.permission_role_id),
+                &resolve_name(row.standard_role_id),
+                &resolve_name(row.permission_role_id),
             );
+            // Discord hard-caps select-menu option labels at 100 chars; role
+            // names can be up to 100 chars each, so a combined label could
+            // exceed that and cause the same silent-400 class this fix is
+            // closing. Truncate defensively rather than risk it.
+            let label: String = label.chars().take(100).collect();
             CreateSelectMenuOption::new(label, row.id.to_string())
         })
         .collect();
+
+    let content = if total > 25 {
+        format!("Choose a role pair to remove (showing 25 of {total} — remove some to see the rest):")
+    } else {
+        "Choose a role pair to remove:".to_string()
+    };
 
     let select = CreateActionRow::SelectMenu(
         CreateSelectMenu::new(
@@ -310,7 +337,7 @@ async fn handle_remove(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
     );
 
     let msg = CreateInteractionResponseMessage::new()
-        .content("Choose a role pair to remove:")
+        .content(content)
         .components(vec![select])
         .ephemeral(true);
     let _ = cmd
