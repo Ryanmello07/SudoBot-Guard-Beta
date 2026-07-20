@@ -371,27 +371,27 @@ async fn evaluate_gate(
 ) -> Result<EnrollmentDecision, sqlx::Error> {
     let is_admin = auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await?;
 
-    let (has_verified_factor, enrolled_at): (bool, Option<chrono::DateTime<chrono::Utc>>) = if factor == "totp" {
-        let row = sqlx::query!(
-            "SELECT enrolled_at FROM totp_enrollments WHERE guild_id = $1 AND user_id = $2 AND verified = true",
+    let has_verified_factor: bool = if factor == "totp" {
+        sqlx::query!(
+            "SELECT 1 AS present FROM totp_enrollments WHERE guild_id = $1 AND user_id = $2 AND verified = true",
             guild_id_i64,
             user_id_i64
         )
         .fetch_optional(pool)
-        .await?;
-        (row.is_some(), row.map(|r| r.enrolled_at))
+        .await?
+        .is_some()
     } else {
-        let row = sqlx::query!(
-            "SELECT enrolled_at FROM yubikey_enrollments WHERE guild_id = $1 AND user_id = $2 AND verified = true",
+        sqlx::query!(
+            "SELECT 1 AS present FROM yubikey_enrollments WHERE guild_id = $1 AND user_id = $2 AND verified = true",
             guild_id_i64,
             user_id_i64
         )
         .fetch_optional(pool)
-        .await?;
-        (row.is_some(), row.map(|r| r.enrolled_at))
+        .await?
+        .is_some()
     };
 
-    let cooldown_ok = if let Some(enrolled_at) = enrolled_at {
+    let cooldown_ok = if has_verified_factor && is_admin {
         let cooldown_minutes = settings::get_int_setting(
             pool,
             guild_id_i64,
@@ -399,7 +399,39 @@ async fn evaluate_gate(
             settings::ADMIN_REGEN_COOLDOWN_MINUTES_DEFAULT,
         )
         .await?;
-        enrollment::cooldown_elapsed(enrolled_at, chrono::Utc::now(), cooldown_minutes)
+
+        // Anchor the admin's own regenerate cooldown to when they first
+        // requested it (auto-approved instantly, since admins don't need
+        // anyone else's approval), not to the factor's original enrolled_at
+        // — this is the delay the user asked for: request now, complete
+        // only after the cooldown window has passed since that request.
+        let existing_request = sqlx::query!(
+            "SELECT requested_at FROM enrollment_requests
+             WHERE guild_id = $1 AND user_id = $2 AND factor_type = $3
+               AND action = 'regenerate' AND status = 'approved'
+             ORDER BY requested_at DESC LIMIT 1",
+            guild_id_i64,
+            user_id_i64,
+            factor
+        )
+        .fetch_optional(pool)
+        .await?;
+
+        match existing_request {
+            Some(row) => enrollment::cooldown_elapsed(row.requested_at, chrono::Utc::now(), cooldown_minutes),
+            None => {
+                sqlx::query!(
+                    "INSERT INTO enrollment_requests (guild_id, user_id, factor_type, action, status, approved_by, approved_at)
+                     VALUES ($1, $2, $3, 'regenerate', 'approved', $2, now())",
+                    guild_id_i64,
+                    user_id_i64,
+                    factor
+                )
+                .execute(pool)
+                .await?;
+                false
+            }
+        }
     } else {
         true
     };
@@ -422,6 +454,41 @@ async fn evaluate_gate(
         cooldown_ok,
         has_approved_request,
     ))
+}
+
+/// Builds the reply for `EnrollmentDecision::CooldownNotElapsed`: looks up
+/// the admin's own auto-approved regenerate request (recorded the first time
+/// they clicked) and tells them roughly when the cooldown will have elapsed.
+async fn cooldown_wait_message(pool: &PgPool, guild_id_i64: i64, user_id_i64: i64, factor: &str) -> String {
+    match sqlx::query!(
+        "SELECT requested_at FROM enrollment_requests
+         WHERE guild_id = $1 AND user_id = $2 AND factor_type = $3
+           AND action = 'regenerate' AND status = 'approved'
+         ORDER BY requested_at DESC LIMIT 1",
+        guild_id_i64,
+        user_id_i64,
+        factor
+    )
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(row)) => {
+            let cooldown_minutes = settings::get_int_setting(
+                pool,
+                guild_id_i64,
+                settings::ADMIN_REGEN_COOLDOWN_MINUTES_KEY,
+                settings::ADMIN_REGEN_COOLDOWN_MINUTES_DEFAULT,
+            )
+            .await
+            .unwrap_or(settings::ADMIN_REGEN_COOLDOWN_MINUTES_DEFAULT);
+            let available_at = row.requested_at + chrono::Duration::minutes(cooldown_minutes);
+            format!(
+                "You requested a regenerate for this factor — you can complete it <t:{}:R>.",
+                available_at.timestamp()
+            )
+        }
+        _ => "You've regenerated this factor too recently — try again later.".to_string(),
+    }
 }
 
 async fn handle_totp_button(
@@ -450,7 +517,7 @@ async fn handle_totp_button(
             return reply_component_ephemeral(
                 ctx,
                 comp,
-                "You've regenerated this factor too recently — try again later.",
+                &cooldown_wait_message(pool, guild_id_i64, user_id_i64, "totp").await,
             )
             .await;
         }
@@ -596,7 +663,7 @@ async fn handle_yubikey_button(ctx: &Context, pool: &PgPool, comp: &ComponentInt
             return reply_component_ephemeral(
                 ctx,
                 comp,
-                "You've regenerated this factor too recently — try again later.",
+                &cooldown_wait_message(pool, guild_id_i64, user_id_i64, "yubikey").await,
             )
             .await;
         }
