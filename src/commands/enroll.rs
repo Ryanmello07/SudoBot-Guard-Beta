@@ -478,6 +478,14 @@ async fn handle_totp_button(
             )
             .execute(pool)
             .await;
+            let embed = serenity::all::CreateEmbed::new()
+                .title("TOTP factor regenerating")
+                .description(format!(
+                    "<@{}>'s existing TOTP factor was deleted to begin regeneration.",
+                    comp.user.id
+                ))
+                .color(0xED4245);
+            let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Alert, embed).await;
         }
         EnrollmentDecision::SelfServiceAdd | EnrollmentDecision::ApprovedAdd => {}
     }
@@ -616,6 +624,14 @@ async fn handle_yubikey_button(ctx: &Context, pool: &PgPool, comp: &ComponentInt
             )
             .execute(pool)
             .await;
+            let embed = serenity::all::CreateEmbed::new()
+                .title("YubiKey factor regenerating")
+                .description(format!(
+                    "<@{}>'s existing YubiKey factor was deleted to begin regeneration.",
+                    comp.user.id
+                ))
+                .color(0xED4245);
+            let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Alert, embed).await;
         }
         EnrollmentDecision::SelfServiceAdd | EnrollmentDecision::ApprovedAdd => {}
     }

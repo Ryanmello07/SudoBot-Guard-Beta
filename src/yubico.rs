@@ -41,10 +41,9 @@ impl YubicoClient {
     }
 
     pub async fn verify_otp(&self, otp: &str) -> Result<YubicoVerifyResult, YubicoError> {
-        if otp.len() < 12 {
+        let Some(public_id) = otp.get(..12).map(str::to_string) else {
             return Err(YubicoError::OtpTooShort);
-        }
-        let public_id = otp[..12].to_string();
+        };
         let nonce = generate_nonce();
 
         let mut params = vec![
