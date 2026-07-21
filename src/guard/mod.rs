@@ -2,6 +2,7 @@ pub mod audit_handler;
 pub mod backfill;
 pub mod baseline;
 pub mod reaction;
+pub mod recreation_guard;
 pub mod sweep;
 
 pub const LOCKDOWN_ENABLED_KEY: &str = "lockdown_enabled";

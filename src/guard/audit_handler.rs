@@ -86,10 +86,17 @@ async fn handle_role_delete(ctx: &Context, pool: &PgPool, guild_id_i64: i64, ent
     let Ok(true) = baseline::is_registered_role(pool, guild_id_i64, role_id_i64).await else {
         return; // not a registered role — deletion is fine, guard doesn't care
     };
+
+    if !crate::guard::recreation_guard::try_claim(guild_id_i64, role_id_i64) {
+        return; // already being recreated (a duplicate delivery of this same delete, or the sweep)
+    }
+
     let Ok(Some(base)) = baseline::get_baseline(pool, guild_id_i64, role_id_i64).await else {
+        crate::guard::recreation_guard::release(guild_id_i64, role_id_i64);
         return;
     };
     let _ = reaction::recreate_role(ctx, pool, guild_id_i64, role_id_i64, &base).await;
+    crate::guard::recreation_guard::release(guild_id_i64, role_id_i64);
 }
 
 async fn handle_member_role_update(ctx: &Context, pool: &PgPool, guild_id_i64: i64, entry: &AuditLogEntry) {

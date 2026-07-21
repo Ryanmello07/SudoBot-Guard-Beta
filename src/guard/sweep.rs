@@ -49,14 +49,11 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
 
     // 2. Registered roles that no longer exist among the guild's live roles.
     //
-    // Known edge case (not architecturally fixed here): if a registered role
-    // is deleted and the reactive handler (`audit_handler::handle_role_delete`
-    // -> `reaction::recreate_role`) recreates it right as a sweep tick reads
-    // `role_pairs`/`role_baselines` below, there's a narrow race where this
-    // sweep could still see the not-yet-repointed old role ID, find it
-    // missing from the live guild, and attempt a second recreation. Low
-    // probability given the 5-minute sweep cadence versus the sub-second
-    // window the race requires.
+    // `recreation_guard` prevents this from double-recreating a role that
+    // the reactive handler (`audit_handler::handle_role_delete` ->
+    // `reaction::recreate_role`) is already recreating concurrently — this
+    // used to be a documented-but-assumed-rare race; it happened live (two
+    // recreations 268ms apart) and is now closed by an explicit claim.
     if let Ok(rows) = sqlx::query!(
         "SELECT DISTINCT role_id FROM role_baselines
          WHERE guild_id = $1 AND role_id IN (
@@ -72,9 +69,13 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
         for row in rows {
             let role_id = serenity::all::RoleId::new(row.role_id as u64);
             if !guild.roles.contains_key(&role_id) {
+                if !crate::guard::recreation_guard::try_claim(guild_id_i64, row.role_id) {
+                    continue; // reactive handler is already recreating this role
+                }
                 if let Ok(Some(base)) = baseline::get_baseline(pool, guild_id_i64, row.role_id).await {
                     let _ = reaction::recreate_role(ctx, pool, guild_id_i64, row.role_id, &base).await;
                 }
+                crate::guard::recreation_guard::release(guild_id_i64, row.role_id);
             }
         }
     }
