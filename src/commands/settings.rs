@@ -1,5 +1,5 @@
 use crate::auth;
-use crate::logging::{log, LogTier};
+use crate::logging::{log, user_ref, LogTier};
 use crate::settings::{self, ADMIN_REGEN_COOLDOWN_MINUTES_KEY};
 use serenity::all::{
     ActionRowComponent, CommandDataOption, CommandDataOptionValue, CommandInteraction,
@@ -201,8 +201,10 @@ async fn handle_set(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
     reply_ephemeral(ctx, cmd, &format!("Set {key} = {value}.")).await;
 
     let embed = CreateEmbed::new()
-        .title("Setting changed")
-        .description(format!("<@{}> set `{key}` = `{value}`", cmd.user.id))
+        .title("Setting Changed")
+        .field("Setting", format!("`{key}`"), true)
+        .field("New Value", format!("`{value}`"), true)
+        .field("Changed By", user_ref(cmd.user.id.get() as i64), false)
         .color(0x5865F2);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
 }
@@ -371,8 +373,10 @@ pub async fn handle_modal(ctx: &Context, pool: &PgPool, modal: &ModalInteraction
     }
 
     let log_embed = CreateEmbed::new()
-        .title("Setting changed")
-        .description(format!("<@{}> set `{key}` = `{value}`", modal.user.id))
+        .title("Setting Changed")
+        .field("Setting", format!("`{key}`"), true)
+        .field("New Value", format!("`{value}`"), true)
+        .field("Changed By", user_ref(modal.user.id.get() as i64), false)
         .color(0x5865F2);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, log_embed).await;
 }

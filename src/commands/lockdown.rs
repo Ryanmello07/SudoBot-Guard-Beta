@@ -1,6 +1,6 @@
 use crate::auth;
 use crate::guard;
-use crate::logging::{log, LogTier};
+use crate::logging::{log, user_ref, LogTier};
 use crate::settings;
 use serenity::all::{
     CommandInteraction, CommandOptionType, Context, CreateCommand, CreateCommandOption, CreateEmbed,
@@ -103,10 +103,13 @@ async fn handle_on(
     reply_followup(ctx, cmd, "Lockdown enabled — full guarding is active, and every role's baseline has been refreshed to its current state.").await;
 
     let embed = CreateEmbed::new()
-        .title("Lockdown enabled")
-        .description(format!(
-            "<@{user_id_i64}> enabled lockdown. Permission/name/position guarding is active again; every role's baseline was refreshed to its current live state."
-        ))
+        .title("Lockdown Enabled")
+        .field("Enabled By", user_ref(user_id_i64), true)
+        .field(
+            "Now Active",
+            "Permission/name/position guarding is active again, and every role's baseline was refreshed to its current live state.",
+            false,
+        )
         .color(0xED4245);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
 }
@@ -120,11 +123,14 @@ async fn handle_off(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, guil
     reply_ephemeral(ctx, cmd, "Lockdown disabled — only manual permission-role grant protection remains active.").await;
 
     let embed = CreateEmbed::new()
-        .title("Lockdown disabled")
-        .description(format!(
-            "<@{user_id_i64}> disabled lockdown. Permission/name/position guarding is paused; manual permission-role grants are still reverted and quarantined."
-        ))
-        .color(0xED4245);
+        .title("Lockdown Disabled")
+        .field("Disabled By", user_ref(user_id_i64), true)
+        .field(
+            "Now Active",
+            "Permission/name/position guarding is paused. Manual permission-role grants are still reverted and quarantined.",
+            false,
+        )
+        .color(0x5865F2);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
 }
 

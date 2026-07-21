@@ -1,5 +1,5 @@
 use crate::auth;
-use crate::logging::{log, LogTier};
+use crate::logging::{log, role_ref, user_ref, LogTier};
 use serenity::all::{
     CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType,
     ComponentInteraction, Context, CreateActionRow, CreateCommand, CreateCommandOption,
@@ -295,11 +295,11 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
     reply_ephemeral(ctx, cmd, "Role pair registered.").await;
 
     let embed = CreateEmbed::new()
-        .title("Role pair registered")
-        .description(format!(
-            "<@{}> registered <@&{}> \u{2192} <@&{}> ({} min, {} tier)",
-            cmd.user.id, standard_role, permission_role, session_minutes, alert_tier
-        ))
+        .title("Role Pair Registered")
+        .field("Standard Role", role_ref(standard_role.get() as i64), true)
+        .field("Permission Role", role_ref(permission_role.get() as i64), true)
+        .field("Registered By", user_ref(cmd.user.id.get() as i64), true)
+        .field("Config", format!("Session length: {session_minutes} min\nAlert tier: {alert_tier}"), false)
         .color(0x57F287);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
 }
@@ -513,12 +513,11 @@ pub async fn handle_component(ctx: &Context, pool: &PgPool, comp: &ComponentInte
     let msg = match deleted {
         Ok(Some(row)) => {
             let embed = CreateEmbed::new()
-                .title("Role pair removed")
-                .description(format!(
-                    "<@{}> removed <@&{}> \u{2192} <@&{}>",
-                    comp.user.id, row.standard_role_id, row.permission_role_id
-                ))
-                .color(0xED4245);
+                .title("Role Pair Removed")
+                .field("Standard Role", role_ref(row.standard_role_id), true)
+                .field("Permission Role", role_ref(row.permission_role_id), true)
+                .field("Removed By", user_ref(comp.user.id.get() as i64), true)
+                .color(0x5865F2);
             let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
             CreateInteractionResponseMessage::new()
                 .content("Role pair removed.")

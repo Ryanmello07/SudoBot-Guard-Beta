@@ -1,5 +1,5 @@
 use crate::auth;
-use crate::logging::{log, LogTier};
+use crate::logging::{log, user_ref, LogTier};
 use serenity::all::{
     CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType, Context,
     CreateCommand, CreateCommandOption, CreateEmbed, CreateInteractionResponse,
@@ -97,11 +97,8 @@ async fn handle_claim(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
     reply_ephemeral(ctx, cmd, "You are now a bot admin for this server.").await;
 
     let embed = CreateEmbed::new()
-        .title("Bot admin claimed")
-        .description(format!(
-            "<@{}> claimed bot admin for this server.",
-            cmd.user.id
-        ))
+        .title("Bot Admin Claimed")
+        .field("Claimed By", user_ref(cmd.user.id.get() as i64), false)
         .color(0x5865F2);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
 }
@@ -160,11 +157,9 @@ async fn handle_channel(
     reply_ephemeral(ctx, cmd, &format!("Log channel set to <#{channel_id}>.")).await;
 
     let embed = CreateEmbed::new()
-        .title("Log channel configured")
-        .description(format!(
-            "<@{}> set the log channel to <#{}>.",
-            cmd.user.id, channel_id
-        ))
+        .title("Log Channel Configured")
+        .field("Channel", format!("<#{0}>\n`{0}`", channel_id.get() as i64), true)
+        .field("Configured By", user_ref(cmd.user.id.get() as i64), true)
         .color(0x5865F2);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
 }

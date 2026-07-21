@@ -1,7 +1,7 @@
 use crate::auth;
 use crate::crypto::{encryption, totp};
 use crate::elevation::{self, CodeShape};
-use crate::logging::{log, LogTier};
+use crate::logging::{log, role_ref, user_ref, LogTier};
 use crate::yubico::YubicoClient;
 use serenity::all::{
     CommandDataOptionValue, CommandInteraction, CommandOptionType, Context, CreateCommand,
@@ -112,11 +112,13 @@ async fn handle_auth(
     };
     if failure_count >= LOCKOUT_THRESHOLD {
         let embed = CreateEmbed::new()
-            .title("Auth lockout")
-            .description(format!(
-                "<@{}> is locked out after {} failed attempts in the last {} minutes",
-                cmd.user.id, failure_count, LOCKOUT_WINDOW_MINUTES
-            ))
+            .title("Auth Lockout")
+            .field("User", user_ref(cmd.user.id.get() as i64), true)
+            .field(
+                "Failed Attempts",
+                format!("{failure_count} in the last {LOCKOUT_WINDOW_MINUTES} minutes"),
+                true,
+            )
             .color(0xED4245);
         let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
         return reply_ephemeral(ctx, cmd, "Too many failed attempts. Try again later.").await;
@@ -284,10 +286,9 @@ async fn handle_auth(
 
                 let embed = CreateEmbed::new()
                     .title("Elevated")
-                    .description(format!(
-                        "<@{}> elevated <@&{}>, expires <t:{}:R>",
-                        cmd.user.id, pair.permission_role_id, ts
-                    ))
+                    .field("User", user_ref(cmd.user.id.get() as i64), true)
+                    .field("Role", role_ref(pair.permission_role_id), true)
+                    .field("Expires", format!("<t:{ts}:R>"), false)
                     .color(0x57F287);
                 let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
             }
@@ -423,6 +424,7 @@ async fn handle_deauth(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
     };
 
     let mut dropped = Vec::new();
+    let mut dropped_ids = Vec::new();
     for session in &sessions {
         let permission_role_id = serenity::all::RoleId::new(session.permission_role_id as u64);
         let _ = member.remove_role(&ctx.http, permission_role_id).await;
@@ -438,13 +440,26 @@ async fn handle_deauth(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
             continue;
         }
         dropped.push(format!("<@&{}>", session.permission_role_id));
+        dropped_ids.push(session.permission_role_id);
     }
 
     reply_ephemeral(ctx, cmd, &format!("Dropped: {}", dropped.join(", "))).await;
 
+    // Guard against an empty field value (Discord rejects the embed with a
+    // 400): dropped_ids is empty if every session's revoke UPDATE failed.
+    let roles_field = if dropped_ids.is_empty() {
+        "*None*".to_string()
+    } else {
+        dropped_ids
+            .iter()
+            .map(|id| role_ref(*id))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let embed = CreateEmbed::new()
         .title("Deauthenticated")
-        .description(format!("<@{}> ended their own session(s): {}", cmd.user.id, dropped.join(", ")))
+        .field("User", user_ref(cmd.user.id.get() as i64), true)
+        .field("Sessions Ended", roles_field, false)
         .color(0x5865F2);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
 }

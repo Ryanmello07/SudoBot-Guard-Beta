@@ -299,11 +299,14 @@ async fn handle_approve(
     .await;
 
     let embed = CreateEmbed::new()
-        .title("Enrollment approved")
-        .description(format!(
-            "<@{}> approved a {factor} {action} for <@{target_user}>, window: {window_minutes} min",
-            cmd.user.id
-        ))
+        .title("Enrollment Approved")
+        .field("Staffer", crate::logging::user_ref(target_user.get() as i64), true)
+        .field("Approved By", crate::logging::user_ref(cmd.user.id.get() as i64), true)
+        .field(
+            "Details",
+            format!("Factor: {factor}\nAction: {action}\nWindow: {window_minutes} min"),
+            false,
+        )
         .color(0x5865F2);
     let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Info, embed).await;
 }
@@ -577,12 +580,14 @@ async fn handle_totp_button(
             .execute(pool)
             .await;
             let embed = serenity::all::CreateEmbed::new()
-                .title("TOTP factor regenerating")
-                .description(format!(
-                    "<@{}>'s existing TOTP factor was deleted to begin regeneration.",
-                    comp.user.id
-                ))
-                .color(0xED4245);
+                .title("TOTP Factor Regenerating")
+                .field("User", crate::logging::user_ref(comp.user.id.get() as i64), true)
+                .field(
+                    "Detail",
+                    "The existing TOTP factor was deleted to begin regeneration.",
+                    false,
+                )
+                .color(0x5865F2);
             let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Alert, embed).await;
         }
         EnrollmentDecision::SelfServiceAdd | EnrollmentDecision::ApprovedAdd => {}
@@ -723,12 +728,14 @@ async fn handle_yubikey_button(ctx: &Context, pool: &PgPool, comp: &ComponentInt
             .execute(pool)
             .await;
             let embed = serenity::all::CreateEmbed::new()
-                .title("YubiKey factor regenerating")
-                .description(format!(
-                    "<@{}>'s existing YubiKey factor was deleted to begin regeneration.",
-                    comp.user.id
-                ))
-                .color(0xED4245);
+                .title("YubiKey Factor Regenerating")
+                .field("User", crate::logging::user_ref(comp.user.id.get() as i64), true)
+                .field(
+                    "Detail",
+                    "The existing YubiKey factor was deleted to begin regeneration.",
+                    false,
+                )
+                .color(0x5865F2);
             let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Alert, embed).await;
         }
         EnrollmentDecision::SelfServiceAdd | EnrollmentDecision::ApprovedAdd => {}
@@ -888,8 +895,9 @@ async fn handle_totp_verify_modal(
     }
 
     let embed = serenity::all::CreateEmbed::new()
-        .title("TOTP enrolled")
-        .description(format!("<@{}> enrolled/regenerated TOTP", modal.user.id))
+        .title("TOTP Enrolled")
+        .field("User", crate::logging::user_ref(modal.user.id.get() as i64), true)
+        .field("Factor", "TOTP enrolled/regenerated", true)
         .color(0x57F287);
     let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Info, embed).await;
 }
@@ -966,8 +974,9 @@ async fn handle_yubikey_modal(
     reply_modal_ephemeral(ctx, modal, &content).await;
 
     let embed = serenity::all::CreateEmbed::new()
-        .title("YubiKey enrolled")
-        .description(format!("<@{}> enrolled/regenerated a YubiKey", modal.user.id))
+        .title("YubiKey Enrolled")
+        .field("User", crate::logging::user_ref(modal.user.id.get() as i64), true)
+        .field("Factor", "YubiKey enrolled/regenerated", true)
         .color(0x57F287);
     let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Info, embed).await;
 }

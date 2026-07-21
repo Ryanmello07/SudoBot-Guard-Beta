@@ -130,16 +130,16 @@ impl EventHandler for Handler {
 
         let actual_bits = new.permissions.bits() as i64;
         if guard::permission_drifted(base.permissions, actual_bits) {
-            let _ = guard::reaction::revert_permissions(&ctx, &self.pool, guild_id_i64, role_id_i64, base.permissions).await;
+            let _ = guard::reaction::revert_permissions(&ctx, &self.pool, guild_id_i64, role_id_i64, base.permissions, actual_bits).await;
         }
         if let Some(baseline_name) = &base.name {
             if guard::name_drifted(baseline_name, &new.name) {
-                let _ = guard::reaction::revert_name(&ctx, &self.pool, guild_id_i64, role_id_i64, baseline_name).await;
+                let _ = guard::reaction::revert_name(&ctx, &self.pool, guild_id_i64, role_id_i64, baseline_name, &new.name).await;
             }
         }
         if let Some(baseline_position) = base.position {
             if guard::position_drifted(baseline_position, new.position as i32) {
-                let _ = guard::reaction::revert_position(&ctx, &self.pool, guild_id_i64, role_id_i64, baseline_position).await;
+                let _ = guard::reaction::revert_position(&ctx, &self.pool, guild_id_i64, role_id_i64, baseline_position, new.position as i32).await;
             }
         }
     }
@@ -302,8 +302,9 @@ async fn sweep_expired_sessions(http: Arc<Http>, pool: sqlx::PgPool) {
             }
 
             let embed = serenity::all::CreateEmbed::new()
-                .title("Session expired")
-                .description(format!("<@{}>'s <@&{}> expired", session.user_id, session.permission_role_id))
+                .title("Session Expired")
+                .field("Member", logging::user_ref(session.user_id), true)
+                .field("Role", logging::role_ref(session.permission_role_id), true)
                 .color(0x5865F2);
             let _ = logging::log(&pool, &http, session.guild_id, logging::LogTier::Info, embed).await;
         }

@@ -63,11 +63,14 @@ async fn handle_role_create(ctx: &Context, pool: &PgPool, guild_id_i64: i64, ent
     }
 
     let embed = serenity::all::CreateEmbed::new()
-        .title("Role creation reverted (lockdown)")
-        .description(format!(
-            "A new role (<@&{role_id_i64}>) was created by <@{}> while lockdown was active — deleted. Lockdown treats the role list as frozen.",
-            entry.user_id
-        ))
+        .title("Role Creation Reverted (Lockdown)")
+        .field("Role", crate::logging::role_ref_deleted(role_id_i64), true)
+        .field("Created By", crate::logging::user_ref(entry.user_id.get() as i64), true)
+        .field(
+            "Reason",
+            "The role was created while lockdown was active — deleted. Lockdown treats the role list as frozen.",
+            false,
+        )
         .color(0xED4245);
     let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Alert, embed).await;
 }
@@ -120,17 +123,22 @@ async fn handle_member_role_update(ctx: &Context, pool: &PgPool, guild_id_i64: i
                         .await
                         .unwrap_or_default();
 
+                    let quarantine_note = if stripped.is_empty() {
+                        // An empty result can't distinguish "granter had no
+                        // active sessions" from "quarantine-on-manual-grant is
+                        // off" without a new query, which is out of scope —
+                        // so state both possibilities honestly rather than
+                        // assert one we can't verify.
+                        "No sessions quarantined (the granter had none active, or quarantine-on-manual-grant is off).".to_string()
+                    } else {
+                        "The granter's own active session(s) were quarantined.".to_string()
+                    };
                     let embed = serenity::all::CreateEmbed::new()
-                        .title("Manual permission-role grant reverted")
-                        .description(format!(
-                            "<@{member_id_i64}> was manually granted <@&{added_role_id_i64}> by <@{}> — reverted.{}",
-                            entry.user_id,
-                            if stripped.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" <@{}>'s own active sessions were quarantined.", entry.user_id)
-                            }
-                        ))
+                        .title("Manual Permission-Role Grant Reverted")
+                        .field("Member", crate::logging::user_ref(member_id_i64), true)
+                        .field("Role", crate::logging::role_ref(added_role_id_i64), true)
+                        .field("Granted By", crate::logging::user_ref(entry.user_id.get() as i64), true)
+                        .field("Quarantine", quarantine_note, false)
                         .color(0xED4245);
                     let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Alert, embed).await;
                 }

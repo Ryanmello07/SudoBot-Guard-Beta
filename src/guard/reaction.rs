@@ -1,18 +1,34 @@
-use crate::logging::{log, role_ref, LogTier};
+use crate::logging::{log, role_ref, role_ref_deleted, LogTier};
 use crate::settings;
 use serenity::all::{Context, EditRole, GuildId, Permissions, RoleId, UserId};
 use sqlx::PgPool;
 
-/// Comma-separated human-readable names of every permission set in `bits`,
-/// via serenity's own permission-name table — so a log reader sees
-/// "Administrator, Ban Members" instead of a raw integer.
-fn permission_names(bits: i64) -> String {
-    let names = Permissions::from_bits_truncate(bits as u64).get_permission_names();
-    if names.is_empty() {
-        "*None*".to_string()
-    } else {
-        names.join(", ")
+/// Renders what an unauthorized edit actually *changed* about a role's
+/// permissions, as a Discord ```diff code block: `-` lines for permissions
+/// the edit stripped away from the guarded baseline, `+` lines for ones it
+/// granted. Permissions are boolean flags, so a diff is the natural shape,
+/// and Discord renders `+`/`-` lines in green/red. Shows only the delta —
+/// never the full restored baseline, which is uninformative (and often just
+/// "None") when the point is which specific bits an attacker toggled.
+fn permission_diff(baseline_bits: i64, actual_bits: i64) -> String {
+    let baseline = Permissions::from_bits_truncate(baseline_bits as u64);
+    let actual = Permissions::from_bits_truncate(actual_bits as u64);
+    let added = actual & !baseline;
+    let removed = baseline & !actual;
+
+    let mut lines = Vec::new();
+    for name in removed.get_permission_names() {
+        lines.push(format!("- {name}"));
     }
+    for name in added.get_permission_names() {
+        lines.push(format!("+ {name}"));
+    }
+    if lines.is_empty() {
+        // Drift was detected, so this shouldn't normally happen — be
+        // defensive rather than emit an empty diff block.
+        return "*No permission bits changed*".to_string();
+    }
+    format!("```diff\n{}\n```", lines.join("\n"))
 }
 
 pub async fn revert_permissions(
@@ -21,6 +37,7 @@ pub async fn revert_permissions(
     guild_id_i64: i64,
     role_id_i64: i64,
     target_bits: i64,
+    actual_bits: i64,
 ) -> Result<(), serenity::Error> {
     let guild_id = GuildId::new(guild_id_i64 as u64);
     let role_id = RoleId::new(role_id_i64 as u64);
@@ -31,7 +48,7 @@ pub async fn revert_permissions(
     let embed = serenity::all::CreateEmbed::new()
         .title("Permission Edit Reverted")
         .field("Role", role_ref(role_id_i64), true)
-        .field("Restored Permissions", permission_names(target_bits), false)
+        .field("Permission Changes (reverted)", permission_diff(target_bits, actual_bits), false)
         .color(0xED4245);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
     Ok(())
@@ -43,14 +60,17 @@ pub async fn revert_name(
     guild_id_i64: i64,
     role_id_i64: i64,
     target_name: &str,
+    actual_name: &str,
 ) -> Result<(), serenity::Error> {
     let guild_id = GuildId::new(guild_id_i64 as u64);
     let role_id = RoleId::new(role_id_i64 as u64);
     guild_id.edit_role(&ctx.http, role_id, EditRole::new().name(target_name)).await?;
 
     let embed = serenity::all::CreateEmbed::new()
-        .title("Role rename reverted")
-        .description(format!("<@&{role_id_i64}>'s name was reverted to the guarded baseline."))
+        .title("Role Rename Reverted")
+        .field("Role", role_ref(role_id_i64), false)
+        .field("Unauthorized Name", actual_name, true)
+        .field("Restored Name", target_name, true)
         .color(0xED4245);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
     Ok(())
@@ -62,6 +82,7 @@ pub async fn revert_position(
     guild_id_i64: i64,
     role_id_i64: i64,
     target_position: i32,
+    actual_position: i32,
 ) -> Result<(), serenity::Error> {
     let guild_id = GuildId::new(guild_id_i64 as u64);
     let role_id = RoleId::new(role_id_i64 as u64);
@@ -69,8 +90,10 @@ pub async fn revert_position(
     guild_id.edit_role_position(&ctx.http, role_id, position_u16).await?;
 
     let embed = serenity::all::CreateEmbed::new()
-        .title("Role position reverted")
-        .description(format!("<@&{role_id_i64}>'s position was reverted to the guarded baseline."))
+        .title("Role Position Reverted")
+        .field("Role", role_ref(role_id_i64), false)
+        .field("Unauthorized Position", actual_position.to_string(), true)
+        .field("Restored Position", target_position.to_string(), true)
         .color(0xED4245);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
     Ok(())
@@ -205,11 +228,13 @@ pub async fn recreate_role(
 
     let embed = serenity::all::CreateEmbed::new()
         .title(if is_registered { "Registered role recreated" } else { "Role recreated (lockdown)" })
-        .description(format!(
-            "{} (previously <@&{old_role_id_i64}>) was deleted and has been recreated as <@&{}>, from its guarded baseline. Re-check any external references to the old role ID.",
-            if is_registered { "A registered role" } else { "A role" },
-            new_role.id
-        ))
+        .field("Old Role", role_ref_deleted(old_role_id_i64), true)
+        .field("New Role", role_ref(new_role.id.get() as i64), true)
+        .field(
+            "Note",
+            "The role was deleted and has been recreated from its guarded baseline. Re-check any external references to the old role ID.",
+            false,
+        )
         .color(0xED4245);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
     Ok(new_role)

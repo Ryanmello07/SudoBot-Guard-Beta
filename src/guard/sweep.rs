@@ -29,16 +29,16 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
 
             let actual_bits = role.permissions.bits() as i64;
             if permission_drifted(base.permissions, actual_bits) {
-                let _ = reaction::revert_permissions(ctx, pool, guild_id_i64, role_id_i64, base.permissions).await;
+                let _ = reaction::revert_permissions(ctx, pool, guild_id_i64, role_id_i64, base.permissions, actual_bits).await;
             }
             if let Some(baseline_name) = &base.name {
                 if name_drifted(baseline_name, &role.name) {
-                    let _ = reaction::revert_name(ctx, pool, guild_id_i64, role_id_i64, baseline_name).await;
+                    let _ = reaction::revert_name(ctx, pool, guild_id_i64, role_id_i64, baseline_name, &role.name).await;
                 }
             }
             if let Some(baseline_position) = base.position {
                 if position_drifted(baseline_position, role.position as i32) {
-                    let _ = reaction::revert_position(ctx, pool, guild_id_i64, role_id_i64, baseline_position).await;
+                    let _ = reaction::revert_position(ctx, pool, guild_id_i64, role_id_i64, baseline_position, role.position as i32).await;
                 }
             }
         }
@@ -128,8 +128,14 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
                 let _ = reaction::strip_manual_grant(ctx, guild_id_i64, permission_role_id_i64, member_id_i64).await;
 
                 let embed = serenity::all::CreateEmbed::new()
-                    .title("Orphaned permission-role grant reverted (found by sweep)")
-                    .description(format!("<@{member_id_i64}> held <@&{permission_role_id_i64}> with no active session backing it — reverted. No audit-log entry was available to identify who granted it, so no quarantine was applied."))
+                    .title("Orphaned Permission-Role Grant Reverted")
+                    .field("Member", crate::logging::user_ref(member_id_i64), true)
+                    .field("Role", crate::logging::role_ref(permission_role_id_i64), true)
+                    .field(
+                        "Granted By",
+                        "Unknown — no audit-log entry was available (found by periodic sweep), so no quarantine was applied.",
+                        false,
+                    )
                     .color(0xED4245);
                 let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Alert, embed).await;
             }
