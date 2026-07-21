@@ -105,20 +105,21 @@ impl EventHandler for Handler {
     /// through the audit log.
     ///
     /// Permission and name are guarded for every role by absolute equality
-    /// against the baseline (each is an independent per-role value, so
-    /// reverting one role never perturbs another). Position is different:
-    /// it is one shared ordering across the whole guild, so it is NOT
-    /// guarded by absolute equality — doing so caused a self-sustaining
-    /// oscillation (see the design note on `guard::escaped_hierarchy`).
-    /// Instead, position is guarded only for REGISTERED roles and only
-    /// against the one invariant with security meaning: whether the role
-    /// has climbed at or above the bot's own top role, past which the bot
-    /// can no longer manage it. A plain reorder that never crosses that
-    /// boundary produces no revert here.
+    /// against the baseline, reverting just the one changed role — each is
+    /// an independent per-role value, so that never perturbs another role.
+    /// Position is guarded by absolute equality too (every role below the
+    /// bot's own top role), but NOT by reverting just this one role: a
+    /// position is one shared ordering across the whole guild, so fixing
+    /// one role's index necessarily shifts others, and reacting to that
+    /// shift as a fresh violation is what caused a self-sustaining
+    /// oscillation in an earlier version of this handler. See the design
+    /// note on `guard::position_drifted` — position corrections always go
+    /// through `guard::reaction::reconcile_positions`, which fixes every
+    /// guarded role in one atomic bulk call instead.
     ///
     /// No explicit self-action filter is needed: when the bot's own revert
-    /// lands, this event re-fires with live state now within bounds, so the
-    /// checks below simply find nothing to do.
+    /// lands, this event re-fires with live state now matching baseline, so
+    /// the checks below simply find nothing to do.
     async fn guild_role_update(&self, ctx: Context, _old: Option<serenity::model::guild::Role>, new: serenity::model::guild::Role) {
         let guild_id_i64 = new.guild_id.get() as i64;
         let role_id_i64 = new.id.get() as i64;
@@ -128,36 +129,26 @@ impl EventHandler for Handler {
             return;
         }
 
-        let Ok(Some(base)) = guard::baseline::get_baseline(&self.pool, guild_id_i64, role_id_i64).await else {
-            return;
-        };
-
-        let actual_bits = new.permissions.bits() as i64;
-        if guard::permission_drifted(base.permissions, actual_bits) {
-            let _ = guard::reaction::revert_permissions(&ctx, &self.pool, guild_id_i64, role_id_i64, base.permissions, actual_bits).await;
-        }
-        if let Some(baseline_name) = &base.name {
-            if guard::name_drifted(baseline_name, &new.name) {
-                let _ = guard::reaction::revert_name(&ctx, &self.pool, guild_id_i64, role_id_i64, baseline_name, &new.name).await;
+        if let Ok(Some(base)) = guard::baseline::get_baseline(&self.pool, guild_id_i64, role_id_i64).await {
+            let actual_bits = new.permissions.bits() as i64;
+            if guard::permission_drifted(base.permissions, actual_bits) {
+                let _ = guard::reaction::revert_permissions(&ctx, &self.pool, guild_id_i64, role_id_i64, base.permissions, actual_bits).await;
             }
-        }
-        // Position: registered roles only, hierarchy-escape only. A None
-        // bot_top (bot member not cached) means we can't locate the
-        // boundary — skip the position check rather than fail open; the
-        // permission/name reverts above already ran unconditionally.
-        if guard::baseline::is_registered_role(&self.pool, guild_id_i64, role_id_i64)
-            .await
-            .unwrap_or(false)
-        {
-            if let Some(bot_top) = guard::bot_top_position(&ctx, new.guild_id) {
-                if guard::escaped_hierarchy(new.position, bot_top) {
-                    // There is no meaningful "correct absolute index"
-                    // anymore — the only goal is getting the role back below
-                    // the boundary, so revert to just under the bot's top.
-                    let safe_position = bot_top.saturating_sub(1) as i32;
-                    let _ = guard::reaction::revert_position(&ctx, &self.pool, guild_id_i64, role_id_i64, safe_position, new.position as i32).await;
+            if let Some(baseline_name) = &base.name {
+                if guard::name_drifted(baseline_name, &new.name) {
+                    let _ = guard::reaction::revert_name(&ctx, &self.pool, guild_id_i64, role_id_i64, baseline_name, &new.name).await;
                 }
             }
+        }
+
+        // Position reconciliation is whole-guild, not per-role — see the
+        // doc comment above. The claim prevents the burst of
+        // guild_role_update events from one reorder (every role Discord
+        // shifts fires its own event) from each recomputing and firing a
+        // redundant bulk correction.
+        if guard::position_reconcile_guard::try_claim(guild_id_i64) {
+            let _ = guard::reaction::reconcile_positions(&ctx, &self.pool, guild_id_i64).await;
+            guard::position_reconcile_guard::release(guild_id_i64);
         }
     }
 

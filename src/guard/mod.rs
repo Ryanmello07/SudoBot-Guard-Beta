@@ -1,6 +1,7 @@
 pub mod audit_handler;
 pub mod backfill;
 pub mod baseline;
+pub mod position_reconcile_guard;
 pub mod reaction;
 pub mod recreation_guard;
 pub mod sweep;
@@ -29,40 +30,38 @@ pub fn name_drifted(baseline_name: &str, actual_name: &str) -> bool {
     baseline_name != actual_name
 }
 
-/// True if a REGISTERED role has climbed to be at or above the bot's own
-/// top role — the point at which the bot can no longer manage it via the
-/// Discord API. This is the only position invariant guarded now.
+/// Position is guarded for every role, absolute — a bare equality check
+/// just like `permission_drifted`, scoped by callers to roles below the
+/// bot's own top role (see `bot_top_position`; the bot can't manage a role
+/// at or above its own position regardless).
 ///
 /// DESIGN NOTE (the single source of truth for the position-guarding
 /// rationale; other call sites reference this doc rather than restating
-/// it): absolute per-role position guarding was tried and caused a live,
-/// self-sustaining oscillation, because Discord positions are one shared
-/// ordering across the whole guild and restoring one role's exact index
-/// necessarily perturbs its neighbors — the old equality check then
-/// flagged each perturbed neighbor as a fresh violation and reverted it,
-/// which perturbed the first role again, hammering Discord's API and
-/// spamming the log channel (100+ reverts in ~a minute in the incident
-/// that prompted this rewrite). A hierarchy-boundary crossing is immune to
-/// that cascade: it's a one-directional inequality, not an equality
-/// assertion against a value shared with other roles, so a renormalized
-/// neighbor is invisible unless it *itself* crosses the boundary — which,
-/// for a guild with only a couple of roles near the top, essentially never
-/// cascades, and even then each correction monotonically resolves a real
-/// boundary violation rather than fighting over a shared index. A plain
-/// reorder among roles that never crosses the bot's boundary produces zero
-/// reverts. Direction matches `crate::commands::protect::validate_hierarchy`
-/// exactly (`role_position >= bot_top_position` is the violation there too;
-/// in Discord's convention a larger position number sits higher).
-pub fn escaped_hierarchy(role_position: u16, bot_top_position: u16) -> bool {
-    role_position >= bot_top_position
+/// it): absolute per-role position guarding is the right model — a single
+/// unauthorized reorder genuinely converges (revert it, done). It only
+/// *looked* unstable in an earlier incident because the correction was
+/// applied one role at a time: reverting role A's index necessarily shifts
+/// some other role B as a side effect of Discord's shared ordering, that
+/// shift got misread as a fresh violation on B, B got reverted, which
+/// shifted A again — a tug-of-war, invisible at low speed (the 5-minute
+/// sweep or the ~1-minute audit-log lag naturally rate-limited it) but a
+/// real flood once reverts became instant (100+ in a minute, live). The
+/// fix is not to narrow what's guarded — it's `reaction::reconcile_positions`
+/// applying every guarded role's correction in ONE atomic bulk Discord API
+/// call, so there is no intermediate "wrong" state for the bot to
+/// misinterpret as a new violation. See that function for the mechanism.
+pub fn position_drifted(baseline_position: i32, actual_position: i32) -> bool {
+    baseline_position != actual_position
 }
 
 /// The bot's own current top role position, read from the cache — the
-/// boundary `escaped_hierarchy` compares registered roles against. `None`
-/// when the guild or the bot's own member entry isn't cached (in which
-/// case callers must skip position guarding, never fail open on the other
-/// checks). Mirrors the `bot_top_position` computation in
-/// `crate::commands::protect`'s `handle_add`, including its `unwrap_or(0)`.
+/// boundary that scopes which roles get position guarding at all (a role
+/// at or above this position can't be managed by the bot via the Discord
+/// API, so there's nothing to enforce there). `None` when the guild or the
+/// bot's own member entry isn't cached (in which case callers must skip
+/// position guarding, never fail open on the other checks). Mirrors the
+/// `bot_top_position` computation in `crate::commands::protect`'s
+/// `handle_add`, including its `unwrap_or(0)`.
 pub fn bot_top_position(
     ctx: &serenity::all::Context,
     guild_id: serenity::all::GuildId,
@@ -112,21 +111,13 @@ mod tests {
     }
 
     #[test]
-    fn escaped_hierarchy_true_when_role_equals_bot_top() {
-        // A role sitting at exactly the bot's top position can't be managed
-        // by the bot — same boundary `validate_hierarchy` rejects at
-        // registration time (`>=`).
-        assert!(escaped_hierarchy(10, 10));
+    fn position_drift_detected() {
+        assert!(position_drifted(3, 7));
     }
 
     #[test]
-    fn escaped_hierarchy_true_when_role_above_bot_top() {
-        assert!(escaped_hierarchy(15, 10));
-    }
-
-    #[test]
-    fn escaped_hierarchy_false_when_role_below_bot_top() {
-        assert!(!escaped_hierarchy(3, 10));
+    fn position_drift_not_detected_when_unchanged() {
+        assert!(!position_drifted(3, 3));
     }
 
     #[test]

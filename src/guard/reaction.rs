@@ -1,6 +1,6 @@
 use crate::logging::{log, role_ref, role_ref_deleted, LogTier};
 use crate::settings;
-use serenity::all::{Context, EditRole, GuildId, Permissions, RoleId, UserId};
+use serenity::all::{Context, EditRole, GuildId, LightMethod, Permissions, Request, RoleId, Route, UserId};
 use sqlx::PgPool;
 
 /// Renders what an unauthorized edit actually *changed* about a role's
@@ -78,25 +78,116 @@ pub async fn revert_name(
     Ok(())
 }
 
-pub async fn revert_position(
+/// Sets multiple roles' positions in ONE Discord API call — the whole point
+/// being that Discord applies the entire list as a single transaction, with
+/// no intermediate "some roles moved, others haven't yet" state for the
+/// bot's own event handlers to misread as a fresh violation. Serenity's
+/// `GuildId::edit_role_position` only ever sends a one-role list; this
+/// builds the same request (`PATCH /guilds/{id}/roles`, which Discord's API
+/// accepts a full list for) with every target included, bypassing that
+/// convenience wrapper deliberately.
+async fn bulk_reposition(
     ctx: &Context,
-    pool: &PgPool,
     guild_id_i64: i64,
-    role_id_i64: i64,
-    target_position: i32,
-    actual_position: i32,
-) -> Result<(), serenity::Error> {
+    targets: &[(i64, u16)],
+) -> Result<Vec<serenity::model::guild::Role>, serenity::Error> {
     let guild_id = GuildId::new(guild_id_i64 as u64);
-    let role_id = RoleId::new(role_id_i64 as u64);
-    let position_u16 = u16::try_from(target_position).unwrap_or(0);
-    tracing::warn!(guild_id = guild_id_i64, role_id = role_id_i64, target_position, actual_position, "guard action: reverting registered role that escaped the bot's hierarchy boundary");
-    guild_id.edit_role_position(&ctx.http, role_id, position_u16).await?;
+    let body = format!(
+        "[{}]",
+        targets
+            .iter()
+            .map(|(role_id, position)| format!(r#"{{"id":"{role_id}","position":{position}}}"#))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let result = ctx
+        .http
+        .fire::<Vec<serenity::model::guild::Role>>(
+            Request::new(Route::GuildRoles { guild_id }, LightMethod::Patch).body(Some(body.into_bytes())),
+        )
+        .await?;
+    Ok(result)
+}
+
+/// Compares every guarded role's live position against its baseline and, if
+/// ANY differ, corrects ALL of them in one atomic bulk call (see
+/// `bulk_reposition`) rather than reverting role-by-role. Only roles below
+/// the bot's own top role are guarded — the bot can never manage a role at
+/// or above its own position via the Discord API regardless, so there's
+/// nothing to enforce there. See the design note on
+/// `crate::guard::position_drifted` for why bulk correction is what makes
+/// absolute position guarding actually converge instead of oscillating.
+///
+/// Callers are responsible for the lockdown gate and for serializing
+/// concurrent calls per guild (`position_reconcile_guard`) — this function
+/// always does a fresh full scan and correction when called.
+pub async fn reconcile_positions(ctx: &Context, pool: &PgPool, guild_id_i64: i64) -> Result<(), serenity::Error> {
+    let guild_id = GuildId::new(guild_id_i64 as u64);
+    let Some(bot_top) = crate::guard::bot_top_position(ctx, guild_id) else {
+        return Ok(()); // can't locate the boundary this tick — skip rather than guess
+    };
+    let Some(guild) = ctx.cache.guild(guild_id).map(|g| g.clone()) else {
+        return Ok(());
+    };
+
+    let mut targets = Vec::new();
+    let mut any_drift = false;
+    for role in guild.roles.values() {
+        if role.id == guild_id.everyone_role() {
+            continue; // @everyone's position is fixed by Discord, never a target
+        }
+        if role.position >= bot_top {
+            continue; // above (or at) the bot — unmanageable, unguarded
+        }
+        let role_id_i64 = role.id.get() as i64;
+        let Ok(Some(base)) = crate::guard::baseline::get_baseline(pool, guild_id_i64, role_id_i64).await else {
+            continue; // no baseline yet, nothing to enforce
+        };
+        let Some(baseline_position) = base.position else { continue };
+        let Ok(baseline_position_u16) = u16::try_from(baseline_position) else { continue };
+        if crate::guard::position_drifted(baseline_position, role.position as i32) {
+            any_drift = true;
+        }
+        targets.push((role_id_i64, baseline_position_u16));
+    }
+
+    if !any_drift {
+        return Ok(());
+    }
+
+    tracing::warn!(guild_id = guild_id_i64, role_count = targets.len(), "guard action: reconciling all guarded role positions to baseline (bulk)");
+    let returned = bulk_reposition(ctx, guild_id_i64, &targets).await?;
+
+    // Empirical convergence check: Discord returns the authoritative
+    // post-change position for every role in the guild. If it echoes back
+    // exactly the integers we sent, this correction is final and the next
+    // event should find no drift. If Discord silently normalized any of
+    // them to a different value, comparing against the same absolute
+    // integers will never converge — this is the one thing that decides
+    // whether bulk correction actually fixes absolute position guarding or
+    // just turns per-role oscillation into a slower per-correction one, so
+    // it's logged loudly on every correction rather than assumed.
+    let mut mismatches = Vec::new();
+    for (role_id_i64, sent_position) in &targets {
+        if let Some(returned_role) = returned.iter().find(|r| r.id.get() as i64 == *role_id_i64) {
+            if returned_role.position != *sent_position {
+                mismatches.push((*role_id_i64, *sent_position, returned_role.position));
+            }
+        }
+    }
+    if mismatches.is_empty() {
+        tracing::info!(guild_id = guild_id_i64, "guard: bulk position correction confirmed — Discord echoed back exactly the positions sent");
+    } else {
+        tracing::error!(guild_id = guild_id_i64, ?mismatches, "guard: Discord returned DIFFERENT positions than sent — absolute position guarding cannot converge, this will keep re-triggering");
+    }
 
     let embed = serenity::all::CreateEmbed::new()
-        .title("Role Position Reverted")
-        .field("Role", role_ref(role_id_i64), false)
-        .field("Unauthorized Position", actual_position.to_string(), true)
-        .field("Restored Position", target_position.to_string(), true)
+        .title("Role Positions Reconciled")
+        .field(
+            "Detail",
+            format!("An unauthorized role reorder was detected — {} guarded role(s) (below the bot's own role) were reset to their baseline positions in one bulk correction.", targets.len()),
+            false,
+        )
         .color(0xED4245);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
     Ok(())

@@ -1,4 +1,4 @@
-use crate::guard::{baseline, escaped_hierarchy, is_manual_grant, name_drifted, permission_drifted, reaction};
+use crate::guard::{baseline, is_manual_grant, name_drifted, permission_drifted, position_drifted, reaction};
 use serenity::all::Context;
 use serenity::model::guild::audit_log::{Action, AuditLogEntry, Change, MemberAction, RoleAction};
 use sqlx::PgPool;
@@ -33,15 +33,14 @@ pub async fn handle_entry(
 /// never call any `revert_*` function itself — doing so reintroduces the
 /// exact double-revert bug that got this path removed in the first place.
 ///
-/// Permission/name detection compares the audit entry's own recorded `new`
-/// values against the baseline, not the role's current live state — by the
-/// time this (slower) audit-log entry arrives, the gateway path has typically
+/// Detection compares the audit entry's own recorded `new` values against
+/// the baseline, not the role's current live state — by the time this
+/// (slower) audit-log entry arrives, the gateway/sweep paths have typically
 /// already reverted it, so live state would show no drift even though a
-/// violation genuinely occurred. Position is the exception: it is a shared
-/// ordering with no per-role baseline to compare against, so the recorded
-/// `new` position is tested against the bot's *current* hierarchy boundary
-/// (a registered role at or above the bot's top role), matching the
-/// escape-only revert side (see the design note on `escaped_hierarchy`).
+/// violation genuinely occurred. Position uses the same baseline-equality
+/// check as permission/name (see `position_drifted`), scoped to roles below
+/// the bot's own top role — a role at or above it isn't guarded at all,
+/// since the bot can't manage it regardless.
 async fn handle_role_update(ctx: &Context, pool: &PgPool, guild_id_i64: i64, entry: &AuditLogEntry) {
     let lockdown_enabled = crate::guard::is_lockdown_enabled(pool, guild_id_i64).await.unwrap_or(true);
     if !lockdown_enabled {
@@ -72,17 +71,12 @@ async fn handle_role_update(ctx: &Context, pool: &PgPool, guild_id_i64: i64, ent
                 }
             }
             Change::Position { new: Some(new_position), .. } => {
-                // Position is a shared ordering, so a plain reorder is not a
-                // violation — only a REGISTERED role crossing the bot's own
-                // hierarchy boundary is (see the design note on
-                // `escaped_hierarchy`). Matches the revert side exactly.
-                let guild_id = serenity::all::GuildId::new(guild_id_i64 as u64);
-                if let Some(bot_top) = crate::guard::bot_top_position(ctx, guild_id) {
-                    if escaped_hierarchy(*new_position as u16, bot_top)
-                        && baseline::is_registered_role(pool, guild_id_i64, role_id_i64)
-                            .await
-                            .unwrap_or(false)
-                    {
+                if let Some(baseline_position) = base.position {
+                    let guild_id = serenity::all::GuildId::new(guild_id_i64 as u64);
+                    let below_bot = crate::guard::bot_top_position(ctx, guild_id)
+                        .map(|bot_top| (*new_position as u16) < bot_top)
+                        .unwrap_or(false);
+                    if below_bot && position_drifted(baseline_position, *new_position as i32) {
                         violated = true;
                     }
                 }
