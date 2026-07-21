@@ -49,6 +49,49 @@ impl Handler {
         {
             tracing::error!(error = ?e, %guild_id, "failed to bootstrap admin");
         }
+
+        self.backfill_role_baselines(ctx, guild_id).await;
+    }
+
+    /// Captures a permissions baseline for any role that doesn't have one
+    /// yet — runs at every startup (and every guild join) so a bot restart
+    /// can never leave a role unguarded. Registered roles also get their
+    /// name and position captured.
+    async fn backfill_role_baselines(&self, ctx: &Context, guild_id: GuildId) {
+        let Some(guild) = ctx.cache.guild(guild_id).map(|g| g.clone()) else {
+            tracing::warn!(%guild_id, "guard: guild not in cache, skipping baseline backfill");
+            return;
+        };
+        let guild_id_i64 = guild_id.get() as i64;
+        for role in guild.roles.values() {
+            let role_id_i64 = role.id.get() as i64;
+            match guard::baseline::get_baseline(&self.pool, guild_id_i64, role_id_i64).await {
+                Ok(Some(_)) => continue, // already has a baseline
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(error = ?e, %guild_id, role_id = role_id_i64, "guard: failed to check baseline");
+                    continue;
+                }
+            }
+            let is_registered = guard::baseline::is_registered_role(&self.pool, guild_id_i64, role_id_i64)
+                .await
+                .unwrap_or(false);
+            let name = is_registered.then(|| role.name.clone());
+            let position = is_registered.then_some(role.position as i32);
+            if let Err(e) = guard::baseline::upsert_baseline(
+                &self.pool,
+                guild_id_i64,
+                role_id_i64,
+                role.permissions.bits() as i64,
+                name.as_deref(),
+                position,
+                None,
+            )
+            .await
+            {
+                tracing::error!(error = ?e, %guild_id, role_id = role_id_i64, "guard: failed to backfill baseline");
+            }
+        }
     }
 }
 

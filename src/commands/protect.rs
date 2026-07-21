@@ -237,6 +237,25 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
         .await;
     }
 
+    for (role_id, role_name) in [
+        (standard_role, guild.roles.get(&standard_role).map(|r| r.name.clone())),
+        (permission_role, guild.roles.get(&permission_role).map(|r| r.name.clone())),
+    ] {
+        let role_id_i64 = role_id.get() as i64;
+        let position = guild.roles.get(&role_id).map(|r| r.position as i32);
+        let permissions = guild.roles.get(&role_id).map(|r| r.permissions.bits() as i64).unwrap_or(0);
+        let _ = crate::guard::baseline::upsert_baseline(
+            pool,
+            guild_id_i64,
+            role_id_i64,
+            permissions,
+            role_name.as_deref(),
+            position,
+            None,
+        )
+        .await;
+    }
+
     reply_ephemeral(ctx, cmd, "Role pair registered.").await;
 
     let embed = CreateEmbed::new()
