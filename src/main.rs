@@ -27,6 +27,7 @@ struct Handler {
     encryption_key: [u8; 32],
     yubico: yubico::YubicoClient,
     bot_user_id: AtomicU64,
+    guard_sweep_started: std::sync::atomic::AtomicBool,
 }
 
 impl Handler {
@@ -103,6 +104,24 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(bot_name = %ready.user.name, "connected and ready");
         self.bot_user_id.store(ready.user.id.get(), Ordering::Relaxed);
+
+        if !self.guard_sweep_started.swap(true, Ordering::Relaxed) {
+            let sweep_ctx = ctx.clone();
+            let sweep_pool = self.pool.clone();
+            tokio::spawn(async move {
+                // tokio::time::interval fires immediately on its first
+                // tick(), so this loop's first iteration is the startup
+                // sweep — no separate call needed before the loop.
+                let mut interval = tokio::time::interval(Duration::from_secs(300));
+                loop {
+                    interval.tick().await;
+                    for guild_id in sweep_ctx.cache.guilds() {
+                        guard::sweep::run_once(&sweep_ctx, &sweep_pool, guild_id).await;
+                    }
+                }
+            });
+        }
+
         for guild in &ready.guilds {
             self.setup_guild(&ctx, guild.id).await;
         }
@@ -274,6 +293,7 @@ async fn main() {
             encryption_key: config.encryption_key,
             yubico,
             bot_user_id: AtomicU64::new(0),
+            guard_sweep_started: std::sync::atomic::AtomicBool::new(false),
         })
         .await
         .expect("failed to create Discord client — check DISCORD_TOKEN");
