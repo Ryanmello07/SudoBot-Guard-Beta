@@ -5,6 +5,7 @@ mod crypto;
 mod db;
 mod elevation;
 mod enrollment;
+mod guard;
 mod logging;
 mod settings;
 mod yubico;
