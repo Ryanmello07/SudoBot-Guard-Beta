@@ -6,7 +6,7 @@ use crate::yubico::YubicoClient;
 use serenity::all::{
     CommandDataOptionValue, CommandInteraction, CommandOptionType, ComponentInteraction, Context,
     CreateActionRow, CreateCommand, CreateCommandOption, CreateInputText, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateModal, InputTextStyle,
+    CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateModal, InputTextStyle,
 };
 use sqlx::PgPool;
 
@@ -35,6 +35,11 @@ pub fn commands() -> Vec<CreateCommand> {
 async fn reply_ephemeral(ctx: &Context, cmd: &CommandInteraction, content: &str) {
     let msg = CreateInteractionResponseMessage::new().content(content).ephemeral(true);
     let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(msg)).await;
+}
+
+async fn reply_followup(ctx: &Context, cmd: &CommandInteraction, content: &str) {
+    let msg = CreateInteractionResponseFollowup::new().content(content).ephemeral(true);
+    let _ = cmd.create_followup(&ctx.http, msg).await;
 }
 
 fn extract_authcode(sub: &serenity::all::CommandDataOption) -> Option<String> {
@@ -71,8 +76,19 @@ pub async fn handle(
         }
     }
 
+    // Defer now, before any potentially-slow work below: every subcommand
+    // calls elevation::verify_code, which can make a live Yubico network
+    // call and risk Discord's 3-second interaction ack window. Matches the
+    // established pattern (auth.rs, panic.rs) of deferring once before
+    // anything slow — every reply from here on must go through
+    // reply_followup instead of reply_ephemeral.
+    if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = ?e, "failed to defer calm interaction");
+        return;
+    }
+
     let Some(authcode) = extract_authcode(sub) else {
-        return reply_ephemeral(ctx, cmd, "Missing required code.").await;
+        return reply_followup(ctx, cmd, "Missing required code.").await;
     };
 
     match sub.name.as_str() {
@@ -96,18 +112,18 @@ async fn handle_vote(
 ) {
     match elevation::verify_code(pool, guild_id_i64, user_id_i64, authcode, encryption_key, yubico).await {
         Ok(true) => {}
-        Ok(false) => return reply_ephemeral(ctx, cmd, "That code didn't verify.").await,
+        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
         Err(e) => {
             tracing::error!(error = ?e, "calm: error verifying vote code");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     }
 
     if let Err(e) = panic::cast_vote(pool, guild_id_i64, user_id_i64).await {
         tracing::error!(error = ?e, "calm: failed to record vote");
-        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
     }
-    reply_ephemeral(ctx, cmd, "Your vote to end panic mode has been recorded.").await;
+    reply_followup(ctx, cmd, "Your vote to end panic mode has been recorded.").await;
     resolve_after_vote_change(ctx, pool, guild_id, guild_id_i64, user_id_i64, "voted to end panic").await;
 }
 
@@ -124,19 +140,27 @@ async fn handle_cancel(
 ) {
     match elevation::verify_code(pool, guild_id_i64, user_id_i64, authcode, encryption_key, yubico).await {
         Ok(true) => {}
-        Ok(false) => return reply_ephemeral(ctx, cmd, "That code didn't verify.").await,
+        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
         Err(e) => {
             tracing::error!(error = ?e, "calm: error verifying cancel code");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     }
 
     if let Err(e) = panic::cancel_vote(pool, guild_id_i64, user_id_i64).await {
         tracing::error!(error = ?e, "calm: failed to cancel vote");
-        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
     }
-    reply_ephemeral(ctx, cmd, "Your vote has been retracted.").await;
+    reply_followup(ctx, cmd, "Your vote has been retracted.").await;
     let _ = panic::update_vote_message(ctx, pool, guild_id_i64, false).await;
+    panic::log_event(
+        pool,
+        ctx,
+        guild_id_i64,
+        "Panic Vote Cancelled",
+        vec![("Cancelled By", user_ref(user_id_i64), true)],
+    )
+    .await;
 }
 
 async fn handle_override(
@@ -152,26 +176,26 @@ async fn handle_override(
 ) {
     match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
         Ok(true) => {}
-        Ok(false) => return reply_ephemeral(ctx, cmd, "You need to be a bot admin to override panic mode.").await,
+        Ok(false) => return reply_followup(ctx, cmd, "You need to be a bot admin to override panic mode.").await,
         Err(e) => {
             tracing::error!(error = ?e, "calm: failed to check bot admin status");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     }
     match elevation::verify_code(pool, guild_id_i64, user_id_i64, authcode, encryption_key, yubico).await {
         Ok(true) => {}
-        Ok(false) => return reply_ephemeral(ctx, cmd, "That code didn't verify.").await,
+        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
         Err(e) => {
             tracing::error!(error = ?e, "calm: error verifying override code");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     }
 
     if let Err(e) = panic::end_panic(pool, guild_id_i64).await {
         tracing::error!(error = ?e, "calm: failed to end panic via override");
-        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
     }
-    reply_ephemeral(ctx, cmd, "Panic mode ended by admin override.").await;
+    reply_followup(ctx, cmd, "Panic mode ended by admin override.").await;
     let _ = panic::update_vote_message(ctx, pool, guild_id_i64, true).await;
     panic::log_event(
         pool,
