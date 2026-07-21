@@ -29,6 +29,21 @@ pub fn commands() -> Vec<CreateCommand> {
                 )
                 .required(true),
             ),
+        )
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "panic-channel",
+                "Set the channel where panic-mode vote messages are posted",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Channel,
+                    "channel",
+                    "The channel to post panic votes in",
+                )
+                .required(true),
+            ),
         )]
 }
 
@@ -39,6 +54,7 @@ pub async fn handle(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
     match sub.name.as_str() {
         "claim" => handle_claim(ctx, pool, cmd).await,
         "channel" => handle_channel(ctx, pool, cmd, sub).await,
+        "panic-channel" => handle_panic_channel(ctx, pool, cmd, sub).await,
         _ => {}
     }
 }
@@ -158,6 +174,66 @@ async fn handle_channel(
 
     let embed = CreateEmbed::new()
         .title("Log Channel Configured")
+        .field("Channel", format!("<#{0}>\n`{0}`", channel_id.get() as i64), true)
+        .field("Configured By", user_ref(cmd.user.id.get() as i64), true)
+        .color(0x5865F2);
+    let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
+}
+
+async fn handle_panic_channel(
+    ctx: &Context,
+    pool: &PgPool,
+    cmd: &CommandInteraction,
+    sub: &CommandDataOption,
+) {
+    let Some(guild_id) = cmd.guild_id else {
+        return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = cmd.user.id.get() as i64;
+
+    match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return reply_ephemeral(ctx, cmd, "You need to be a bot admin to use this command.").await
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check bot admin status");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    let CommandDataOptionValue::SubCommand(opts) = &sub.value else {
+        return;
+    };
+    let channel_id = opts.iter().find_map(|o| {
+        if let CommandDataOptionValue::Channel(id) = o.value {
+            Some(id)
+        } else {
+            None
+        }
+    });
+    let Some(channel_id) = channel_id else {
+        return reply_ephemeral(ctx, cmd, "No channel provided.").await;
+    };
+
+    if let Err(e) = sqlx::query!(
+        "INSERT INTO panic_channels (guild_id, channel_id) VALUES ($1, $2)
+         ON CONFLICT (guild_id) DO UPDATE SET channel_id = EXCLUDED.channel_id",
+        guild_id_i64,
+        channel_id.get() as i64
+    )
+    .execute(pool)
+    .await
+    {
+        tracing::error!(error = ?e, "failed to set panic channel");
+        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+    }
+
+    reply_ephemeral(ctx, cmd, &format!("Panic vote channel set to <#{channel_id}>.")).await;
+
+    let embed = CreateEmbed::new()
+        .title("Panic Channel Configured")
         .field("Channel", format!("<#{0}>\n`{0}`", channel_id.get() as i64), true)
         .field("Configured By", user_ref(cmd.user.id.get() as i64), true)
         .color(0x5865F2);
