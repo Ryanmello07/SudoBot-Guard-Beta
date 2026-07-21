@@ -69,7 +69,7 @@ async fn handle_role_update(ctx: &Context, pool: &PgPool, guild_id_i64: i64, ent
             }
             Change::Position { new: Some(new_position), .. } => {
                 if let Some(baseline_position) = base.position {
-                    if position_drifted(baseline_position, *new_position as i32, is_registered) {
+                    if position_drifted(baseline_position, *new_position as i32) {
                         let _ = reaction::revert_position(ctx, pool, guild_id_i64, role_id_i64, baseline_position).await;
                     }
                 }

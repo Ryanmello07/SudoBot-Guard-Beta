@@ -45,7 +45,9 @@ pub async fn sync_role_baselines(
                 false
             });
         let name = is_registered.then(|| role.name.clone());
-        let position = is_registered.then_some(role.position as i32);
+        // Position is captured for every role, not just registered ones —
+        // it's tied to Discord's role hierarchy, not just cosmetic identity.
+        let position = Some(role.position as i32);
 
         if let Err(e) = baseline::upsert_baseline(
             pool,

@@ -243,16 +243,18 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
     ] {
         let role_id_i64 = role_id.get() as i64;
 
-        // A baseline may already exist from the startup backfill (permissions
-        // only, since the role wasn't registered yet), or from a prior
-        // `/protect add` on this same role before a `/protect remove` +
+        // A baseline may already exist from the startup backfill, or from a
+        // prior `/protect add` on this same role before a `/protect remove` +
         // re-add. Either way, its `permissions` value is already trusted and
         // must not be reset to whatever the role's live permissions happen to
         // be at this exact instant — that could bake in an in-flight tamper
-        // as the new "trusted" state. But name/position, which only ever get
-        // captured for *registered* roles, are supposed to be backfilled
-        // right now — so when a baseline already exists, only update those
-        // two fields instead of skipping entirely.
+        // as the new "trusted" state. But `name`, which only ever gets
+        // captured for *registered* roles, needs backfilling right now that
+        // this role is becoming one — so when a baseline already exists,
+        // only update name/position instead of skipping entirely. (Position
+        // itself is already captured for every role regardless of
+        // registration, but re-writing it here alongside name is harmless
+        // and keeps this call a single, simple "backfill what's missing" step.)
         let position = guild.roles.get(&role_id).map(|r| r.position as i32);
         let permissions = guild.roles.get(&role_id).map(|r| r.permissions.bits() as i64).unwrap_or(0);
         match crate::guard::baseline::get_baseline(pool, guild_id_i64, role_id_i64).await {

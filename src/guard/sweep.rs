@@ -40,7 +40,7 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
                 }
             }
             if let Some(baseline_position) = base.position {
-                if position_drifted(baseline_position, role.position as i32, is_registered) {
+                if position_drifted(baseline_position, role.position as i32) {
                     let _ = reaction::revert_position(ctx, pool, guild_id_i64, role_id_i64, baseline_position).await;
                 }
             }

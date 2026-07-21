@@ -27,10 +27,12 @@ pub fn name_drifted(baseline_name: &str, actual_name: &str, is_registered: bool)
     is_registered && baseline_name != actual_name
 }
 
-/// Position changes are only guarded for registered roles, same reasoning
-/// as `name_drifted`.
-pub fn position_drifted(baseline_position: i32, actual_position: i32, is_registered: bool) -> bool {
-    is_registered && baseline_position != actual_position
+/// Unlike `name_drifted`, position is guarded for every role regardless of
+/// registration — a role's position is tied to Discord's role hierarchy
+/// (which roles can escape above which), not just cosmetic identity, so
+/// this one gets the same "always guarded" treatment as `permission_drifted`.
+pub fn position_drifted(baseline_position: i32, actual_position: i32) -> bool {
+    baseline_position != actual_position
 }
 
 /// True if `added_role_id` is one of the guild's registered permission
@@ -70,18 +72,13 @@ mod tests {
     }
 
     #[test]
-    fn position_drift_ignored_for_unregistered_role() {
-        assert!(!position_drifted(3, 7, false));
-    }
-
-    #[test]
-    fn position_drift_detected_for_registered_role() {
-        assert!(position_drifted(3, 7, true));
+    fn position_drift_detected_regardless_of_registration() {
+        assert!(position_drifted(3, 7));
     }
 
     #[test]
     fn position_drift_not_detected_when_unchanged() {
-        assert!(!position_drifted(3, 3, true));
+        assert!(!position_drifted(3, 3));
     }
 
     #[test]
