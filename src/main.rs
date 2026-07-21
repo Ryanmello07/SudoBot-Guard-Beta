@@ -201,6 +201,9 @@ impl EventHandler for Handler {
                 "settings" => commands::settings::handle(&ctx, &self.pool, &cmd).await,
                 "enroll" => commands::enroll::handle(&ctx, &self.pool, &cmd).await,
                 "lockdown" => commands::lockdown::handle(&ctx, &self.pool, &cmd).await,
+                "panic" => commands::panic::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await,
+                "panic-voters" => commands::panic_voters::handle(&ctx, &self.pool, &cmd).await,
+                "calm" => commands::calm::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await,
                 "auth" | "deauth" | "status" => {
                     commands::auth::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await
                 }
@@ -211,6 +214,8 @@ impl EventHandler for Handler {
                     commands::protect::handle_component(&ctx, &self.pool, &comp).await;
                 } else if comp.data.custom_id == "settings_select" {
                     commands::settings::handle_component(&ctx, &self.pool, &comp).await;
+                } else if comp.data.custom_id == "panic_vote_button" || comp.data.custom_id == "panic_cancel_button" {
+                    commands::calm::handle_component(&ctx, &comp).await;
                 } else {
                     commands::enroll::handle_component(&ctx, &self.pool, &self.encryption_key, &comp).await;
                 }
@@ -218,6 +223,8 @@ impl EventHandler for Handler {
             Interaction::Modal(modal) => {
                 if modal.data.custom_id.starts_with("settings_modal:") {
                     commands::settings::handle_modal(&ctx, &self.pool, &modal).await;
+                } else if modal.data.custom_id == "panic_vote_modal" || modal.data.custom_id == "panic_cancel_modal" {
+                    commands::calm::handle_modal(&ctx, &self.pool, &self.encryption_key, &self.yubico, &modal).await;
                 } else {
                     commands::enroll::handle_modal(&ctx, &self.pool, &self.encryption_key, &self.yubico, &modal).await
                 }

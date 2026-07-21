@@ -1,7 +1,9 @@
 pub mod auth;
+pub mod calm;
 pub mod enroll;
 pub mod lockdown;
 pub mod panic;
+pub mod panic_voters;
 pub mod protect;
 pub mod settings;
 pub mod setup;
@@ -16,6 +18,9 @@ pub async fn register_all(ctx: &Context, guild_id: GuildId) -> serenity::Result<
         .chain(enroll::commands())
         .chain(auth::commands())
         .chain(lockdown::commands())
+        .chain(panic::commands())
+        .chain(panic_voters::commands())
+        .chain(calm::commands())
         .collect();
     guild_id.set_commands(&ctx.http, commands).await?;
     Ok(())

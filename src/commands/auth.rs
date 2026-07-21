@@ -91,6 +91,17 @@ async fn handle_auth(
     let guild_id_i64 = guild_id.get() as i64;
     let user_id_i64 = cmd.user.id.get() as i64;
 
+    match crate::panic::is_active(pool, guild_id_i64).await {
+        Ok(true) => {
+            return reply_ephemeral(ctx, cmd, "Panic mode is active — new elevation is blocked until it ends.").await
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check panic active state");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
     // --- Lockout check ---
     let failure_count = match sqlx::query!(
         "SELECT COUNT(*) AS count FROM auth_attempts
