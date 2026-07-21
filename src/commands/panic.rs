@@ -79,42 +79,49 @@ pub async fn handle(
         }
     });
 
-    match panic::cooldown_remaining(pool, guild_id_i64).await {
-        Ok(Some(until)) => {
-            let is_admin = auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await.unwrap_or(false);
-            let bypassed = if is_admin {
-                match authcode {
-                    Some(code) => elevation::verify_code(pool, guild_id_i64, user_id_i64, &code, encryption_key, yubico)
-                        .await
-                        .unwrap_or(false),
-                    None => false,
-                }
-            } else {
-                false
-            };
-            if !bypassed {
-                let ts = until.timestamp();
-                return reply_ephemeral(
-                    ctx,
-                    cmd,
-                    &format!("Panic mode is on cooldown until <t:{ts}:R>. A bot admin can bypass this with `/panic authcode:<code>`."),
-                )
-                .await;
-            }
-        }
-        Ok(None) => {}
+    let cooldown = match panic::cooldown_remaining(pool, guild_id_i64).await {
+        Ok(v) => v,
         Err(e) => {
             tracing::error!(error = ?e, "panic: failed to check cooldown");
             return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
         }
-    }
+    };
 
-    // --- Trigger (mass revoke + lockdown + panic_active), then reply ---
+    // Defer now, before any potentially-slow work below: the admin-bypass
+    // 2FA check can make a live Yubico network call, and trigger() does
+    // guild-wide session revocation. Matches auth.rs's established pattern
+    // of deferring before anything that could exceed Discord's 3-second
+    // interaction ack window — every reply from here on must go through
+    // reply_followup instead of reply_ephemeral.
     if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
         tracing::error!(error = ?e, "failed to defer panic interaction");
         return;
     }
 
+    if let Some(until) = cooldown {
+        let is_admin = auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await.unwrap_or(false);
+        let bypassed = if is_admin {
+            match authcode {
+                Some(code) => elevation::verify_code(pool, guild_id_i64, user_id_i64, &code, encryption_key, yubico)
+                    .await
+                    .unwrap_or(false),
+                None => false,
+            }
+        } else {
+            false
+        };
+        if !bypassed {
+            let ts = until.timestamp();
+            return reply_followup(
+                ctx,
+                cmd,
+                &format!("Panic mode is on cooldown until <t:{ts}:R>. A bot admin can bypass this with `/panic authcode:<code>`."),
+            )
+            .await;
+        }
+    }
+
+    // --- Trigger (mass revoke + lockdown + panic_active), then reply ---
     let revoked_count = panic::trigger(ctx, pool, guild_id, user_id_i64).await;
     if let Err(e) = panic::post_vote_message(ctx, pool, guild_id_i64).await {
         tracing::error!(error = ?e, guild_id = guild_id_i64, "panic: failed to post vote message");
