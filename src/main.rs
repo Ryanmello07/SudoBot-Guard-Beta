@@ -106,7 +106,7 @@ impl EventHandler for Handler {
     /// it only compares against ones that already exist). A brand-new role
     /// is essentially never already registered, but the registration check
     /// is kept for consistency with how baselines are captured everywhere
-    /// else (startup backfill, `/protect add`, `/baseline update`).
+    /// else (startup backfill, `/protect add`, `/lockdown on`).
     async fn guild_role_create(&self, _ctx: Context, new: serenity::model::guild::Role) {
         let guild_id_i64 = new.guild_id.get() as i64;
         let role_id_i64 = new.id.get() as i64;
@@ -140,7 +140,7 @@ impl EventHandler for Handler {
                 "protect" => commands::protect::handle(&ctx, &self.pool, &cmd).await,
                 "settings" => commands::settings::handle(&ctx, &self.pool, &cmd).await,
                 "enroll" => commands::enroll::handle(&ctx, &self.pool, &cmd).await,
-                "baseline" => commands::baseline::handle(&ctx, &self.pool, &cmd).await,
+                "lockdown" => commands::lockdown::handle(&ctx, &self.pool, &cmd).await,
                 "auth" | "deauth" | "status" => {
                     commands::auth::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await
                 }

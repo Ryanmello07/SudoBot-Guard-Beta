@@ -1,0 +1,110 @@
+use crate::auth;
+use crate::guard;
+use crate::logging::{log, LogTier};
+use crate::settings;
+use serenity::all::{
+    CommandInteraction, CommandOptionType, Context, CreateCommand, CreateCommandOption, CreateEmbed,
+    CreateInteractionResponse, CreateInteractionResponseMessage, GuildId,
+};
+use sqlx::PgPool;
+
+pub fn commands() -> Vec<CreateCommand> {
+    vec![CreateCommand::new("lockdown")
+        .description("Toggle full guard enforcement")
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "on",
+            "Re-enable full guarding and refresh every role's baseline to its current state",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "off",
+            "Relax guarding — only manual permission-role grant protection stays active",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "status",
+            "Show whether lockdown is currently on or off",
+        ))]
+}
+
+async fn reply_ephemeral(ctx: &Context, cmd: &CommandInteraction, content: &str) {
+    let msg = CreateInteractionResponseMessage::new().content(content).ephemeral(true);
+    let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(msg)).await;
+}
+
+pub async fn handle(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
+    let Some(sub) = cmd.data.options.first() else { return };
+    let Some(guild_id) = cmd.guild_id else {
+        return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = cmd.user.id.get() as i64;
+
+    match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => return reply_ephemeral(ctx, cmd, "You need to be a bot admin to use this command.").await,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check bot admin status");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    match sub.name.as_str() {
+        "on" => handle_on(ctx, pool, cmd, guild_id, guild_id_i64, user_id_i64).await,
+        "off" => handle_off(ctx, pool, cmd, guild_id_i64, user_id_i64).await,
+        "status" => handle_status(ctx, pool, cmd, guild_id_i64).await,
+        _ => {}
+    }
+}
+
+async fn handle_on(
+    ctx: &Context,
+    pool: &PgPool,
+    cmd: &CommandInteraction,
+    guild_id: GuildId,
+    guild_id_i64: i64,
+    user_id_i64: i64,
+) {
+    if let Err(e) = settings::set_setting(pool, guild_id_i64, guard::LOCKDOWN_ENABLED_KEY, "true", user_id_i64).await {
+        tracing::error!(error = ?e, "failed to enable lockdown");
+        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+    }
+    guard::backfill::sync_role_baselines(ctx, pool, guild_id, true, Some(user_id_i64)).await;
+
+    reply_ephemeral(ctx, cmd, "Lockdown enabled — full guarding is active, and every role's baseline has been refreshed to its current state.").await;
+
+    let embed = CreateEmbed::new()
+        .title("Lockdown enabled")
+        .description(format!(
+            "<@{user_id_i64}> enabled lockdown. Permission/name/position guarding is active again; every role's baseline was refreshed to its current live state."
+        ))
+        .color(0xED4245);
+    let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
+}
+
+async fn handle_off(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, guild_id_i64: i64, user_id_i64: i64) {
+    if let Err(e) = settings::set_setting(pool, guild_id_i64, guard::LOCKDOWN_ENABLED_KEY, "false", user_id_i64).await {
+        tracing::error!(error = ?e, "failed to disable lockdown");
+        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+    }
+
+    reply_ephemeral(ctx, cmd, "Lockdown disabled — only manual permission-role grant protection remains active.").await;
+
+    let embed = CreateEmbed::new()
+        .title("Lockdown disabled")
+        .description(format!(
+            "<@{user_id_i64}> disabled lockdown. Permission/name/position guarding is paused; manual permission-role grants are still reverted and quarantined."
+        ))
+        .color(0xED4245);
+    let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
+}
+
+async fn handle_status(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, guild_id_i64: i64) {
+    let enabled = guard::is_lockdown_enabled(pool, guild_id_i64).await.unwrap_or_else(|e| {
+        tracing::error!(error = ?e, "failed to read lockdown state");
+        true // fail closed for the status display too — never report "off" on a read error
+    });
+    let state = if enabled { "on" } else { "off" };
+    reply_ephemeral(ctx, cmd, &format!("Lockdown is currently **{state}**.")).await;
+}
