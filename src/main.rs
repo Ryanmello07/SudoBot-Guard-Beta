@@ -7,6 +7,7 @@ mod elevation;
 mod enrollment;
 mod guard;
 mod logging;
+mod panic;
 mod settings;
 mod yubico;
 
