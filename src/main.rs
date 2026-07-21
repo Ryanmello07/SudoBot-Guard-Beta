@@ -103,30 +103,19 @@ impl EventHandler for Handler {
     /// Captures a baseline for a role the instant it's created, so it's
     /// guarded from the moment it exists rather than only after the next
     /// bot restart (or the next sweep tick, which never creates baselines —
-    /// it only compares against ones that already exist). A brand-new role
-    /// is essentially never already registered, but the registration check
-    /// is kept for consistency with how baselines are captured everywhere
-    /// else (startup backfill, `/protect add`, `/lockdown on`).
+    /// it only compares against ones that already exist). Name and position
+    /// are captured for every role, not just registered ones — the whole
+    /// role list is kept a carbon copy of its baseline state.
     async fn guild_role_create(&self, _ctx: Context, new: serenity::model::guild::Role) {
         let guild_id_i64 = new.guild_id.get() as i64;
         let role_id_i64 = new.id.get() as i64;
-        let is_registered = guard::baseline::is_registered_role(&self.pool, guild_id_i64, role_id_i64)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(error = ?e, guild_id = guild_id_i64, role_id = role_id_i64, "guard: failed to check role registration for new role");
-                false
-            });
-        let name = is_registered.then(|| new.name.clone());
-        // Position is captured for every role, not just registered ones —
-        // it's tied to Discord's role hierarchy, not just cosmetic identity.
-        let position = Some(new.position as i32);
         if let Err(e) = guard::baseline::upsert_baseline(
             &self.pool,
             guild_id_i64,
             role_id_i64,
             new.permissions.bits() as i64,
-            name.as_deref(),
-            position,
+            Some(&new.name),
+            Some(new.position as i32),
             None,
         )
         .await

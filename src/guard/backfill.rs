@@ -38,24 +38,16 @@ pub async fn sync_role_baselines(
             }
         }
 
-        let is_registered = baseline::is_registered_role(pool, guild_id_i64, role_id_i64)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(error = ?e, %guild_id, role_id = role_id_i64, "guard: failed to check role registration during baseline sync");
-                false
-            });
-        let name = is_registered.then(|| role.name.clone());
-        // Position is captured for every role, not just registered ones —
-        // it's tied to Discord's role hierarchy, not just cosmetic identity.
-        let position = Some(role.position as i32);
-
+        // Name and position are captured for every role, not just
+        // registered ones — the whole role list is kept a carbon copy of
+        // its baseline state, matching how permissions are always guarded.
         if let Err(e) = baseline::upsert_baseline(
             pool,
             guild_id_i64,
             role_id_i64,
             role.permissions.bits() as i64,
-            name.as_deref(),
-            position,
+            Some(&role.name),
+            Some(role.position as i32),
             updated_by,
         )
         .await

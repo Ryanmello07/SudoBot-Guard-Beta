@@ -33,13 +33,6 @@ async fn handle_role_update(ctx: &Context, pool: &PgPool, guild_id_i64: i64, ent
     let Some(target_id) = entry.target_id else { return };
     let role_id_i64 = target_id.get() as i64;
 
-    let is_registered = match baseline::is_registered_role(pool, guild_id_i64, role_id_i64).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(error = ?e, "guard: failed to check role registration");
-            return;
-        }
-    };
     let Ok(Some(base)) = baseline::get_baseline(pool, guild_id_i64, role_id_i64).await else {
         // No baseline yet means this role predates both the startup backfill
         // and guild_role_create's on-creation capture ever running against
@@ -62,7 +55,7 @@ async fn handle_role_update(ctx: &Context, pool: &PgPool, guild_id_i64: i64, ent
             }
             Change::Name { new: Some(new_name), .. } => {
                 if let Some(baseline_name) = &base.name {
-                    if name_drifted(baseline_name, new_name, is_registered) {
+                    if name_drifted(baseline_name, new_name) {
                         let _ = reaction::revert_name(ctx, pool, guild_id_i64, role_id_i64, baseline_name).await;
                     }
                 }

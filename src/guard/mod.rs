@@ -22,16 +22,17 @@ pub fn permission_drifted(baseline_bits: i64, actual_bits: i64) -> bool {
     baseline_bits != actual_bits
 }
 
-/// Name changes are only guarded for roles currently registered in
-/// `role_pairs` — renaming an ordinary role isn't a security concern.
-pub fn name_drifted(baseline_name: &str, actual_name: &str, is_registered: bool) -> bool {
-    is_registered && baseline_name != actual_name
+/// Name is guarded for every role regardless of registration, matching
+/// `permission_drifted` and `position_drifted` — the role list is kept a
+/// carbon copy of its baseline state, full stop.
+pub fn name_drifted(baseline_name: &str, actual_name: &str) -> bool {
+    baseline_name != actual_name
 }
 
-/// Unlike `name_drifted`, position is guarded for every role regardless of
-/// registration — a role's position is tied to Discord's role hierarchy
-/// (which roles can escape above which), not just cosmetic identity, so
-/// this one gets the same "always guarded" treatment as `permission_drifted`.
+/// Position is guarded for every role regardless of registration — a
+/// role's position is tied to Discord's role hierarchy (which roles can
+/// escape above which), not just cosmetic identity, so this one gets the
+/// same "always guarded" treatment as `permission_drifted`.
 pub fn position_drifted(baseline_position: i32, actual_position: i32) -> bool {
     baseline_position != actual_position
 }
@@ -58,18 +59,13 @@ mod tests {
     }
 
     #[test]
-    fn name_drift_ignored_for_unregistered_role() {
-        assert!(!name_drifted("Old Name", "New Name", false));
-    }
-
-    #[test]
-    fn name_drift_detected_for_registered_role() {
-        assert!(name_drifted("Old Name", "New Name", true));
+    fn name_drift_detected_regardless_of_registration() {
+        assert!(name_drifted("Old Name", "New Name"));
     }
 
     #[test]
     fn name_drift_not_detected_when_unchanged() {
-        assert!(!name_drifted("Same", "Same", true));
+        assert!(!name_drifted("Same", "Same"));
     }
 
     #[test]
