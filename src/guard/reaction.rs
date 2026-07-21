@@ -41,6 +41,7 @@ pub async fn revert_permissions(
 ) -> Result<(), serenity::Error> {
     let guild_id = GuildId::new(guild_id_i64 as u64);
     let role_id = RoleId::new(role_id_i64 as u64);
+    tracing::warn!(guild_id = guild_id_i64, role_id = role_id_i64, target_bits, actual_bits, "guard action: reverting unauthorized role permission edit");
     guild_id
         .edit_role(&ctx.http, role_id, EditRole::new().permissions(Permissions::from_bits_truncate(target_bits as u64)))
         .await?;
@@ -64,6 +65,7 @@ pub async fn revert_name(
 ) -> Result<(), serenity::Error> {
     let guild_id = GuildId::new(guild_id_i64 as u64);
     let role_id = RoleId::new(role_id_i64 as u64);
+    tracing::warn!(guild_id = guild_id_i64, role_id = role_id_i64, target_name, actual_name, "guard action: reverting unauthorized role rename");
     guild_id.edit_role(&ctx.http, role_id, EditRole::new().name(target_name)).await?;
 
     let embed = serenity::all::CreateEmbed::new()
@@ -87,6 +89,7 @@ pub async fn revert_position(
     let guild_id = GuildId::new(guild_id_i64 as u64);
     let role_id = RoleId::new(role_id_i64 as u64);
     let position_u16 = u16::try_from(target_position).unwrap_or(0);
+    tracing::warn!(guild_id = guild_id_i64, role_id = role_id_i64, target_position, actual_position, "guard action: reverting registered role that escaped the bot's hierarchy boundary");
     guild_id.edit_role_position(&ctx.http, role_id, position_u16).await?;
 
     let embed = serenity::all::CreateEmbed::new()
@@ -107,6 +110,7 @@ pub async fn strip_manual_grant(
 ) -> Result<(), serenity::Error> {
     let guild_id = GuildId::new(guild_id_i64 as u64);
     let role_id = RoleId::new(role_id_i64 as u64);
+    tracing::warn!(guild_id = guild_id_i64, role_id = role_id_i64, member_id = member_id_i64, "guard action: stripping manually-granted permission role from member");
     let member = guild_id.member(&ctx.http, UserId::new(member_id_i64 as u64)).await?;
     member.remove_role(&ctx.http, role_id).await?;
     Ok(())
@@ -128,6 +132,7 @@ pub async fn quarantine_actor(
     if !enabled {
         return Ok(Vec::new());
     }
+    tracing::warn!(guild_id = guild_id_i64, actor_id = actor_id_i64, "guard action: quarantining actor's active sessions after a guard violation");
 
     let sessions = sqlx::query!(
         "SELECT s.id, r.permission_role_id
@@ -178,6 +183,7 @@ pub async fn recreate_role(
     actor_id: Option<i64>,
 ) -> Result<serenity::model::guild::Role, serenity::Error> {
     let guild_id = GuildId::new(guild_id_i64 as u64);
+    tracing::warn!(guild_id = guild_id_i64, old_role_id = old_role_id_i64, is_registered, actor_id = ?actor_id, "guard action: recreating deleted guarded role from baseline");
     let name = baseline.name.as_deref().unwrap_or("recreated-role");
     let mut builder = EditRole::new()
         .name(name)

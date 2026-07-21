@@ -1,4 +1,4 @@
-use crate::guard::{baseline, name_drifted, permission_drifted, position_drifted, reaction};
+use crate::guard::{baseline, bot_top_position, escaped_hierarchy, name_drifted, permission_drifted, reaction};
 use serenity::all::{Context, GuildId};
 use sqlx::PgPool;
 
@@ -16,11 +16,20 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
 
     let lockdown_enabled = crate::guard::is_lockdown_enabled(pool, guild_id_i64).await.unwrap_or(true);
 
-    // 1. Every role's permission bitmask/name/position vs baseline — a full
-    //    carbon-copy check, registered or not. Skipped entirely when
-    //    lockdown is off — only manual-grant reversion and role recreation
-    //    (steps 2-3 below) stay active regardless of lockdown state.
+    // 1. Every role's permission bitmask/name vs baseline — a full
+    //    carbon-copy check, registered or not. Position is different: it is
+    //    guarded only for REGISTERED roles and only against the
+    //    hierarchy-escape boundary (has the role climbed at or above the
+    //    bot's own top role), never against an absolute baseline index —
+    //    absolute position guarding caused a live oscillation storm (see
+    //    the design note on `crate::guard::escaped_hierarchy`). Skipped
+    //    entirely when lockdown is off — only manual-grant reversion and
+    //    role recreation (steps 2-3 below) stay active regardless of
+    //    lockdown state.
     if lockdown_enabled {
+        // Pure cache read; compute once rather than per-role. `None` (bot
+        // member not cached) simply disables the escape check this tick.
+        let bot_top = bot_top_position(ctx, guild_id);
         for role in guild.roles.values() {
             let role_id_i64 = role.id.get() as i64;
             let Ok(Some(base)) = baseline::get_baseline(pool, guild_id_i64, role_id_i64).await else {
@@ -36,9 +45,14 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
                     let _ = reaction::revert_name(ctx, pool, guild_id_i64, role_id_i64, baseline_name, &role.name).await;
                 }
             }
-            if let Some(baseline_position) = base.position {
-                if position_drifted(baseline_position, role.position as i32) {
-                    let _ = reaction::revert_position(ctx, pool, guild_id_i64, role_id_i64, baseline_position, role.position as i32).await;
+            if let Some(bot_top) = bot_top {
+                if escaped_hierarchy(role.position, bot_top)
+                    && baseline::is_registered_role(pool, guild_id_i64, role_id_i64)
+                        .await
+                        .unwrap_or(false)
+                {
+                    let safe_position = bot_top.saturating_sub(1) as i32;
+                    let _ = reaction::revert_position(ctx, pool, guild_id_i64, role_id_i64, safe_position, role.position as i32).await;
                 }
             }
         }
