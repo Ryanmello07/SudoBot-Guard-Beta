@@ -142,6 +142,7 @@ impl EventHandler for Handler {
                 "protect" => commands::protect::handle(&ctx, &self.pool, &cmd).await,
                 "settings" => commands::settings::handle(&ctx, &self.pool, &cmd).await,
                 "enroll" => commands::enroll::handle(&ctx, &self.pool, &cmd).await,
+                "baseline" => commands::baseline::handle(&ctx, &self.pool, &cmd).await,
                 "auth" | "deauth" | "status" => {
                     commands::auth::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await
                 }
