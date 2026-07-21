@@ -4,7 +4,8 @@ use crate::logging::{log, LogTier};
 use crate::settings;
 use serenity::all::{
     CommandInteraction, CommandOptionType, Context, CreateCommand, CreateCommandOption, CreateEmbed,
-    CreateInteractionResponse, CreateInteractionResponseMessage, GuildId,
+    CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
+    GuildId,
 };
 use sqlx::PgPool;
 
@@ -31,6 +32,17 @@ pub fn commands() -> Vec<CreateCommand> {
 async fn reply_ephemeral(ctx: &Context, cmd: &CommandInteraction, content: &str) {
     let msg = CreateInteractionResponseMessage::new().content(content).ephemeral(true);
     let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(msg)).await;
+}
+
+/// Like `reply_ephemeral`, but for use after the interaction has already been
+/// deferred (e.g. in `handle_on`, which defers immediately on entry to stay
+/// under Discord's 3-second ack window while `sync_role_baselines` runs).
+/// Once deferred, `create_response` can no longer be used for the reply —
+/// Discord already has an initial response recorded — so every reply from
+/// that point on must go through a followup message instead.
+async fn reply_followup(ctx: &Context, cmd: &CommandInteraction, content: &str) {
+    let msg = CreateInteractionResponseFollowup::new().content(content).ephemeral(true);
+    let _ = cmd.create_followup(&ctx.http, msg).await;
 }
 
 pub async fn handle(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
@@ -66,13 +78,24 @@ async fn handle_on(
     guild_id_i64: i64,
     user_id_i64: i64,
 ) {
+    // `sync_role_baselines` does two sequential DB round-trips per role (up
+    // to 250 roles in a guild), with no concurrency — that can easily exceed
+    // Discord's 3-second interaction ack window. Defer immediately so
+    // Discord shows "thinking..." instead of failing the interaction; every
+    // reply from here on must go through `reply_followup` instead of
+    // `reply_ephemeral`, since the initial response has now been sent.
+    if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = ?e, "failed to defer lockdown on interaction");
+        return;
+    }
+
     if let Err(e) = settings::set_setting(pool, guild_id_i64, guard::LOCKDOWN_ENABLED_KEY, "true", user_id_i64).await {
         tracing::error!(error = ?e, "failed to enable lockdown");
-        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
     }
     guard::backfill::sync_role_baselines(ctx, pool, guild_id, true, Some(user_id_i64)).await;
 
-    reply_ephemeral(ctx, cmd, "Lockdown enabled — full guarding is active, and every role's baseline has been refreshed to its current state.").await;
+    reply_followup(ctx, cmd, "Lockdown enabled — full guarding is active, and every role's baseline has been refreshed to its current state.").await;
 
     let embed = CreateEmbed::new()
         .title("Lockdown enabled")
