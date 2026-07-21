@@ -134,13 +134,16 @@ pub async fn revoke_all_sessions(ctx: &Context, pool: &PgPool, guild_id_i64: i64
 /// already confirmed those before calling this.
 pub async fn trigger(ctx: &Context, pool: &PgPool, guild_id: GuildId, triggered_by_i64: i64) -> i64 {
     let guild_id_i64 = guild_id.get() as i64;
-    let revoked_count = revoke_all_sessions(ctx, pool, guild_id_i64).await;
 
-    crate::guard::backfill::sync_role_baselines(ctx, pool, guild_id, true, Some(triggered_by_i64)).await;
-    if let Err(e) = crate::settings::set_setting(pool, guild_id_i64, crate::guard::LOCKDOWN_ENABLED_KEY, "true", triggered_by_i64).await {
-        tracing::error!(error = ?e, guild_id = guild_id_i64, "panic: failed to force lockdown on during trigger");
-    }
-
+    // Set panic_active FIRST — before the (potentially minutes-long)
+    // revocation sweep and the lockdown-forcing calls below. `/auth`'s only
+    // gate against new elevation is checking `is_active` at the top of
+    // `handle_auth`, so until this upsert commits that gate reads `false`
+    // and someone can elevate a brand-new session that the revocation loop
+    // has already passed by. Committing this first shrinks that window from
+    // the whole sweep down to a single INSERT, and fails safe: if anything
+    // later in trigger() errors out partway, panic_active is already true so
+    // new elevation stays blocked rather than silently allowed.
     if let Err(e) = sqlx::query!(
         "INSERT INTO panic_state (guild_id, active, triggered_by, triggered_at, cooldown_until)
          VALUES ($1, true, $2, now(), NULL)
@@ -153,6 +156,25 @@ pub async fn trigger(ctx: &Context, pool: &PgPool, guild_id: GuildId, triggered_
     .await
     {
         tracing::error!(error = ?e, guild_id = guild_id_i64, "panic: failed to set panic_active during trigger");
+    }
+
+    // Guarantee a clean vote slate for the new episode. `end_panic` already
+    // clears votes when an episode ends, but this belt-and-suspenders delete
+    // closes the case where a stale vote row survived (e.g. a vote that raced
+    // a prior episode's end) and would otherwise count toward this fresh
+    // episode's tally from the moment it opens.
+    if let Err(e) = sqlx::query!("DELETE FROM panic_votes WHERE guild_id = $1", guild_id_i64)
+        .execute(pool)
+        .await
+    {
+        tracing::error!(error = ?e, guild_id = guild_id_i64, "panic: failed to clear stale votes during trigger");
+    }
+
+    let revoked_count = revoke_all_sessions(ctx, pool, guild_id_i64).await;
+
+    crate::guard::backfill::sync_role_baselines(ctx, pool, guild_id, true, Some(triggered_by_i64)).await;
+    if let Err(e) = crate::settings::set_setting(pool, guild_id_i64, crate::guard::LOCKDOWN_ENABLED_KEY, "true", triggered_by_i64).await {
+        tracing::error!(error = ?e, guild_id = guild_id_i64, "panic: failed to force lockdown on during trigger");
     }
 
     revoked_count

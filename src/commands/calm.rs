@@ -119,6 +119,23 @@ async fn handle_vote(
         }
     }
 
+    // Recheck panic is still active immediately before mutating state. The
+    // initial gate in handle() ran before deferring/verifying, and Discord
+    // processes interactions concurrently, so another voter's crossing vote
+    // may have already called end_panic (clearing votes, setting inactive,
+    // resolving the message) since then. Without this recheck our cast_vote
+    // would leave a phantom vote row AND our update_vote_message(false) would
+    // resurrect the resolved message back to an active-looking, buttoned
+    // state against an already-ended episode.
+    match panic::is_active(pool, guild_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => return reply_followup(ctx, cmd, "Panic mode has already ended.").await,
+        Err(e) => {
+            tracing::error!(error = ?e, "calm: failed to recheck panic active state before vote");
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
     if let Err(e) = panic::cast_vote(pool, guild_id_i64, user_id_i64).await {
         tracing::error!(error = ?e, "calm: failed to record vote");
         return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
@@ -143,6 +160,19 @@ async fn handle_cancel(
         Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
         Err(e) => {
             tracing::error!(error = ?e, "calm: error verifying cancel code");
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    // Recheck panic is still active immediately before mutating state — the
+    // initial gate in handle() ran before deferring/verifying, and another
+    // interaction may have ended panic since. Without this, update_vote_message
+    // would resurrect an already-resolved message against a dead episode.
+    match panic::is_active(pool, guild_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => return reply_followup(ctx, cmd, "Panic mode has already ended.").await,
+        Err(e) => {
+            tracing::error!(error = ?e, "calm: failed to recheck panic active state before cancel");
             return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     }
@@ -305,6 +335,20 @@ pub async fn handle_modal(
         Ok(false) => return reply_modal_followup(ctx, modal, "That code didn't verify.").await,
         Err(e) => {
             tracing::error!(error = ?e, "calm: error verifying vote/cancel modal code");
+            return reply_modal_followup(ctx, modal, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    // Recheck panic is still active before mutating state — handle_modal has
+    // no is_active gate of its own, and the button that opened this modal may
+    // have been a resurrected one (or panic may have ended concurrently). This
+    // guards both the vote and cancel branches below so neither records a vote
+    // nor resurrects the resolved message against an already-ended episode.
+    match panic::is_active(pool, guild_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => return reply_modal_followup(ctx, modal, "Panic mode has already ended.").await,
+        Err(e) => {
+            tracing::error!(error = ?e, "calm: failed to recheck panic active state before modal action");
             return reply_modal_followup(ctx, modal, "Something went wrong. Try again later.").await;
         }
     }
