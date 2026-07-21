@@ -81,6 +81,20 @@ pub async fn update_registration_metadata(
     Ok(())
 }
 
+/// Deletes a role's baseline row, if any. Used when a role created during
+/// lockdown gets deleted right back — no point keeping a baseline for a
+/// role that no longer exists on Discord.
+pub async fn delete_baseline(pool: &PgPool, guild_id: i64, role_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "DELETE FROM role_baselines WHERE guild_id = $1 AND role_id = $2",
+        guild_id,
+        role_id
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn is_registered_role(
     pool: &PgPool,
     guild_id: i64,

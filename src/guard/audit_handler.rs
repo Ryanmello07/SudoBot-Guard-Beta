@@ -15,6 +15,7 @@ pub async fn handle_entry(
     }
 
     match entry.action {
+        Action::Role(RoleAction::Create) => handle_role_create(ctx, pool, guild_id_i64, entry).await,
         Action::Role(RoleAction::Update) => handle_role_update(ctx, pool, guild_id_i64, entry).await,
         Action::Role(RoleAction::Delete) => handle_role_delete(ctx, pool, guild_id_i64, entry).await,
         Action::Member(MemberAction::RoleUpdate) => {
@@ -22,6 +23,48 @@ pub async fn handle_entry(
         }
         _ => {}
     }
+}
+
+/// Reverts a role *creation* the same way other unauthorized changes get
+/// reverted — by undoing the action outright, not by patching state after
+/// the fact. Position-drift guarding could in principle "fix" every other
+/// role's shifted position once a role is inserted, but Discord's positions
+/// are a dense shared ordering: inserting a role changes the total count,
+/// so there's no way to revert everyone else back to their old absolute
+/// position without the count matching too — this caused the sweep to
+/// re-detect and re-revert the same drift on every tick, indefinitely.
+/// Deleting the new role removes the count mismatch at its source, and
+/// every other role's position snaps back on its own. Self-filtered for
+/// free: `handle_entry` already drops entries where `entry.user_id` is the
+/// bot itself, so this never fires for `reaction::recreate_role`'s own
+/// role-creation (which is logged as the bot's own action).
+async fn handle_role_create(ctx: &Context, pool: &PgPool, guild_id_i64: i64, entry: &AuditLogEntry) {
+    let lockdown_enabled = crate::guard::is_lockdown_enabled(pool, guild_id_i64).await.unwrap_or(true);
+    if !lockdown_enabled {
+        return; // outside lockdown, new roles are just onboarded (see guild_role_create)
+    }
+
+    let Some(target_id) = entry.target_id else { return };
+    let role_id_i64 = target_id.get() as i64;
+    let guild_id = serenity::all::GuildId::new(guild_id_i64 as u64);
+    let role_id = serenity::all::RoleId::new(role_id_i64 as u64);
+
+    if let Err(e) = guild_id.delete_role(&ctx.http, role_id).await {
+        tracing::error!(error = ?e, guild_id = guild_id_i64, role_id = role_id_i64, "guard: failed to delete role created during lockdown");
+        return;
+    }
+    if let Err(e) = baseline::delete_baseline(pool, guild_id_i64, role_id_i64).await {
+        tracing::error!(error = ?e, guild_id = guild_id_i64, role_id = role_id_i64, "guard: failed to remove baseline for role deleted after lockdown creation");
+    }
+
+    let embed = serenity::all::CreateEmbed::new()
+        .title("Role creation reverted (lockdown)")
+        .description(format!(
+            "A new role (<@&{role_id_i64}>) was created by <@{}> while lockdown was active — deleted. Lockdown treats the role list as frozen.",
+            entry.user_id
+        ))
+        .color(0xED4245);
+    let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Alert, embed).await;
 }
 
 async fn handle_role_update(ctx: &Context, pool: &PgPool, guild_id_i64: i64, entry: &AuditLogEntry) {
