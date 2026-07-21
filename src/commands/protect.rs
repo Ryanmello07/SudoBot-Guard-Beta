@@ -242,9 +242,26 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
         (permission_role, guild.roles.get(&permission_role).map(|r| r.name.clone())),
     ] {
         let role_id_i64 = role_id.get() as i64;
+
+        // Only backfill if no baseline exists yet — never overwrite an
+        // existing one. A baseline may already exist from the startup
+        // backfill, or from a prior `/protect add` on this same role before
+        // a `/protect remove` + re-add. Unconditionally upserting here would
+        // silently replace the previously-trusted baseline with whatever the
+        // role's live permissions happen to be at this exact instant, which
+        // could bake in an in-flight tamper as the new "trusted" state.
+        match crate::guard::baseline::get_baseline(pool, guild_id_i64, role_id_i64).await {
+            Ok(Some(_)) => continue, // already has a baseline — don't touch it
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(error = ?e, %guild_id, role_id = role_id_i64, "guard: failed to check baseline before registration backfill");
+                continue;
+            }
+        }
+
         let position = guild.roles.get(&role_id).map(|r| r.position as i32);
         let permissions = guild.roles.get(&role_id).map(|r| r.permissions.bits() as i64).unwrap_or(0);
-        let _ = crate::guard::baseline::upsert_baseline(
+        if let Err(e) = crate::guard::baseline::upsert_baseline(
             pool,
             guild_id_i64,
             role_id_i64,
@@ -253,7 +270,10 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
             position,
             None,
         )
-        .await;
+        .await
+        {
+            tracing::error!(error = ?e, %guild_id, role_id = role_id_i64, "guard: failed to backfill baseline on registration");
+        }
     }
 
     reply_ephemeral(ctx, cmd, "Role pair registered.").await;
