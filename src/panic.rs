@@ -1,3 +1,4 @@
+use serenity::all::{Context, GuildId, RoleId, UserId};
 use sqlx::PgPool;
 
 /// True if the member (given their current role IDs) holds either half of
@@ -75,6 +76,82 @@ pub async fn vote_message_location(pool: &PgPool, guild_id_i64: i64) -> Result<O
         (Some(c), Some(m)) => Some((c, m)),
         _ => None,
     }))
+}
+
+/// Guild-wide session revocation: every currently-active session is
+/// revoked and its permission role stripped from the holder. Returns the
+/// number of sessions revoked, for logging. The guild-wide version of what
+/// `/deauth` already does for a single caller.
+pub async fn revoke_all_sessions(ctx: &Context, pool: &PgPool, guild_id_i64: i64) -> i64 {
+    let sessions = match sqlx::query!(
+        "SELECT s.id, s.user_id, r.permission_role_id
+         FROM sessions s
+         JOIN role_pairs r ON r.id = s.role_pair_id
+         WHERE s.guild_id = $1 AND s.revoked_at IS NULL AND s.expires_at > now()",
+        guild_id_i64
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = ?e, guild_id = guild_id_i64, "panic: failed to load active sessions for guild-wide revocation");
+            return 0;
+        }
+    };
+
+    let guild_id = GuildId::new(guild_id_i64 as u64);
+    let mut revoked_count = 0;
+    for session in &sessions {
+        let permission_role_id = RoleId::new(session.permission_role_id as u64);
+        if let Ok(member) = guild_id.member(&ctx.http, UserId::new(session.user_id as u64)).await {
+            if let Err(e) = member.remove_role(&ctx.http, permission_role_id).await {
+                tracing::error!(error = ?e, guild_id = guild_id_i64, session_id = session.id, "panic: failed to remove permission role during guild-wide revocation");
+            }
+        }
+        if sqlx::query!(
+            "UPDATE sessions SET revoked_at = now(), revoke_reason = 'panic' WHERE id = $1",
+            session.id
+        )
+        .execute(pool)
+        .await
+        .is_ok()
+        {
+            revoked_count += 1;
+        }
+    }
+    revoked_count
+}
+
+/// Executes a panic trigger: mass session revocation, force-lockdown-on
+/// (the same mechanism `/lockdown on` uses), and setting `panic_active`.
+/// Returns the number of sessions revoked. Does NOT check eligibility,
+/// idempotency, or cooldown — the caller (`/panic`'s handler) must have
+/// already confirmed those before calling this.
+pub async fn trigger(ctx: &Context, pool: &PgPool, guild_id: GuildId, triggered_by_i64: i64) -> i64 {
+    let guild_id_i64 = guild_id.get() as i64;
+    let revoked_count = revoke_all_sessions(ctx, pool, guild_id_i64).await;
+
+    crate::guard::backfill::sync_role_baselines(ctx, pool, guild_id, true, Some(triggered_by_i64)).await;
+    if let Err(e) = crate::settings::set_setting(pool, guild_id_i64, crate::guard::LOCKDOWN_ENABLED_KEY, "true", triggered_by_i64).await {
+        tracing::error!(error = ?e, guild_id = guild_id_i64, "panic: failed to force lockdown on during trigger");
+    }
+
+    if let Err(e) = sqlx::query!(
+        "INSERT INTO panic_state (guild_id, active, triggered_by, triggered_at, cooldown_until)
+         VALUES ($1, true, $2, now(), NULL)
+         ON CONFLICT (guild_id) DO UPDATE
+         SET active = true, triggered_by = EXCLUDED.triggered_by, triggered_at = now(), cooldown_until = NULL",
+        guild_id_i64,
+        triggered_by_i64
+    )
+    .execute(pool)
+    .await
+    {
+        tracing::error!(error = ?e, guild_id = guild_id_i64, "panic: failed to set panic_active during trigger");
+    }
+
+    revoked_count
 }
 
 #[cfg(test)]
