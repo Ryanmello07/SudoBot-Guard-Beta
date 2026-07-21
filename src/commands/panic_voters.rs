@@ -1,9 +1,10 @@
 use crate::auth;
 use crate::logging::role_ref;
 use serenity::all::{
-    CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType, Context,
-    CreateCommand, CreateCommandOption, CreateEmbed, CreateInteractionResponse,
-    CreateInteractionResponseMessage,
+    CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType,
+    ComponentInteraction, Context, CreateActionRow, CreateCommand, CreateCommandOption,
+    CreateEmbed, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu,
+    CreateSelectMenuKind, CreateSelectMenuOption, RoleId,
 };
 use sqlx::PgPool;
 
@@ -15,12 +16,18 @@ pub fn commands() -> Vec<CreateCommand> {
                 CreateCommandOption::new(CommandOptionType::Role, "role", "The role to add").required(true),
             ),
         )
-        .add_option(
-            CreateCommandOption::new(CommandOptionType::SubCommand, "remove", "Remove a role from eligible voters")
-                .add_sub_option(
-                    CreateCommandOption::new(CommandOptionType::Role, "role", "The role to remove").required(true),
-                ),
-        )
+        // No role option here deliberately: a Discord `Role`-type option can
+        // only resolve to a role that currently exists in the guild, so it
+        // can never target a voter role whose underlying Discord role was
+        // since deleted (Discord itself rejects the interaction with "A role
+        // id specified is invalid" before the bot even sees it). Removal
+        // instead lists what's actually stored in voter_roles and lets the
+        // admin pick by select menu, mirroring /protect remove's pair menu.
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "remove",
+            "Remove a role from eligible voters (choose from a list)",
+        ))
         .add_option(CreateCommandOption::new(
             CommandOptionType::SubCommand,
             "list",
@@ -52,7 +59,7 @@ pub async fn handle(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
 
     match sub.name.as_str() {
         "add" => handle_add(ctx, pool, cmd, sub, guild_id_i64).await,
-        "remove" => handle_remove(ctx, pool, cmd, sub, guild_id_i64).await,
+        "remove" => handle_remove(ctx, pool, cmd, guild_id_i64).await,
         "list" => handle_list(ctx, pool, cmd, guild_id_i64).await,
         _ => {}
     }
@@ -87,22 +94,125 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
     reply_ephemeral(ctx, cmd, "Voter role added.").await;
 }
 
-async fn handle_remove(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub: &CommandDataOption, guild_id_i64: i64) {
-    let Some(role_id_i64) = extract_role(sub) else {
-        return reply_ephemeral(ctx, cmd, "No role provided.").await;
+async fn handle_remove(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, guild_id_i64: i64) {
+    let Some(guild_id) = cmd.guild_id else {
+        return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
     };
-    if let Err(e) = sqlx::query!(
+
+    let rows = match sqlx::query!("SELECT role_id FROM voter_roles WHERE guild_id = $1 ORDER BY role_id", guild_id_i64)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to list voter roles for removal");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    };
+
+    if rows.is_empty() {
+        return reply_ephemeral(ctx, cmd, "No voter roles are registered yet.").await;
+    }
+
+    // Select-menu option labels don't render mention syntax (unlike message
+    // content), so resolve a real name from cache where possible — falling
+    // back to a plainly-labeled "unknown role" entry (rather than raw
+    // mention markup, which would just show as literal text) for a role
+    // that's since been deleted, since that's exactly the case this menu
+    // exists to handle.
+    let guild = ctx.cache.guild(guild_id).map(|g| g.clone());
+    let resolve_label = |role_id: i64| -> String {
+        guild
+            .as_ref()
+            .and_then(|g| g.roles.get(&RoleId::new(role_id as u64)))
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| format!("Unknown role ({role_id})"))
+    };
+
+    let total = rows.len();
+    let shown: Vec<_> = rows.iter().take(25).collect();
+    let options: Vec<CreateSelectMenuOption> = shown
+        .iter()
+        .map(|row| {
+            let label: String = resolve_label(row.role_id).chars().take(100).collect();
+            CreateSelectMenuOption::new(label, row.role_id.to_string())
+        })
+        .collect();
+
+    let content = if total > 25 {
+        format!("Choose a voter role to remove (showing 25 of {total} — remove some to see the rest):")
+    } else {
+        "Choose a voter role to remove:".to_string()
+    };
+
+    let select = CreateActionRow::SelectMenu(
+        CreateSelectMenu::new("panic_voters_remove_select", CreateSelectMenuKind::String { options })
+            .placeholder("Choose a voter role to remove"),
+    );
+
+    let msg = CreateInteractionResponseMessage::new()
+        .content(content)
+        .components(vec![select])
+        .ephemeral(true);
+    let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(msg)).await;
+}
+
+pub async fn handle_component(ctx: &Context, pool: &PgPool, comp: &ComponentInteraction) {
+    if comp.data.custom_id != "panic_voters_remove_select" {
+        return;
+    }
+    let serenity::all::ComponentInteractionDataKind::StringSelect { values } = &comp.data.kind else {
+        return;
+    };
+    let Some(role_id_i64) = values.first().and_then(|v| v.parse::<i64>().ok()) else {
+        return;
+    };
+    let Some(guild_id) = comp.guild_id else {
+        return;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = comp.user.id.get() as i64;
+
+    match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let msg = CreateInteractionResponseMessage::new()
+                .content("You need to be a bot admin to use this command.")
+                .components(vec![])
+                .ephemeral(true);
+            let _ = comp.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(msg)).await;
+            return;
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check bot admin status");
+            let msg = CreateInteractionResponseMessage::new()
+                .content("Something went wrong. Try again later.")
+                .components(vec![])
+                .ephemeral(true);
+            let _ = comp.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(msg)).await;
+            return;
+        }
+    }
+
+    let deleted = sqlx::query!(
         "DELETE FROM voter_roles WHERE guild_id = $1 AND role_id = $2",
         guild_id_i64,
         role_id_i64
     )
     .execute(pool)
-    .await
-    {
-        tracing::error!(error = ?e, "failed to remove voter role");
-        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
-    }
-    reply_ephemeral(ctx, cmd, "Voter role removed.").await;
+    .await;
+
+    let content = match deleted {
+        Ok(result) if result.rows_affected() > 0 => "Voter role removed.",
+        Ok(_) => "That voter role is already gone.",
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to remove voter role via select menu");
+            "Something went wrong. Try again later."
+        }
+    };
+
+    let msg = CreateInteractionResponseMessage::new().content(content).components(vec![]).ephemeral(true);
+    let _ = comp.create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(msg)).await;
 }
 
 async fn handle_list(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, guild_id_i64: i64) {

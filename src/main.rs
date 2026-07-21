@@ -216,6 +216,8 @@ impl EventHandler for Handler {
                     commands::settings::handle_component(&ctx, &self.pool, &comp).await;
                 } else if comp.data.custom_id == "panic_vote_button" || comp.data.custom_id == "panic_cancel_button" {
                     commands::calm::handle_component(&ctx, &comp).await;
+                } else if comp.data.custom_id == "panic_voters_remove_select" {
+                    commands::panic_voters::handle_component(&ctx, &self.pool, &comp).await;
                 } else {
                     commands::enroll::handle_component(&ctx, &self.pool, &self.encryption_key, &comp).await;
                 }
