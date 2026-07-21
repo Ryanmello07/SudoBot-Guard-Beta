@@ -264,3 +264,82 @@ pub async fn handle_component(ctx: &Context, comp: &ComponentInteraction) {
         tracing::error!(error = ?e, "failed to open panic vote/cancel modal");
     }
 }
+
+pub async fn handle_modal(
+    ctx: &Context,
+    pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &YubicoClient,
+    modal: &serenity::all::ModalInteraction,
+) {
+    if modal.data.custom_id != "panic_vote_modal" && modal.data.custom_id != "panic_cancel_modal" {
+        return;
+    }
+    let Some(guild_id) = modal.guild_id else {
+        return reply_modal_ephemeral(ctx, modal, "This only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = modal.user.id.get() as i64;
+
+    if let Err(e) = modal.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = ?e, "failed to defer calm vote/cancel modal interaction");
+        return;
+    }
+
+    let code = modal
+        .data
+        .components
+        .iter()
+        .flat_map(|row| row.components.iter())
+        .find_map(|c| {
+            if let serenity::all::ActionRowComponent::InputText(input) = c {
+                input.value.clone()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &code, encryption_key, yubico).await {
+        Ok(true) => {}
+        Ok(false) => return reply_modal_followup(ctx, modal, "That code didn't verify.").await,
+        Err(e) => {
+            tracing::error!(error = ?e, "calm: error verifying vote/cancel modal code");
+            return reply_modal_followup(ctx, modal, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    if modal.data.custom_id == "panic_vote_modal" {
+        if let Err(e) = panic::cast_vote(pool, guild_id_i64, user_id_i64).await {
+            tracing::error!(error = ?e, "calm: failed to record vote via modal");
+            return reply_modal_followup(ctx, modal, "Something went wrong. Try again later.").await;
+        }
+        reply_modal_followup(ctx, modal, "Your vote to end panic mode has been recorded.").await;
+        resolve_after_vote_change(ctx, pool, guild_id, guild_id_i64, user_id_i64, "voted via button").await;
+    } else {
+        if let Err(e) = panic::cancel_vote(pool, guild_id_i64, user_id_i64).await {
+            tracing::error!(error = ?e, "calm: failed to cancel vote via modal");
+            return reply_modal_followup(ctx, modal, "Something went wrong. Try again later.").await;
+        }
+        reply_modal_followup(ctx, modal, "Your vote has been retracted.").await;
+        let _ = panic::update_vote_message(ctx, pool, guild_id_i64, false).await;
+        panic::log_event(
+            pool,
+            ctx,
+            guild_id_i64,
+            "Panic Vote Cancelled",
+            vec![("Cancelled By", crate::logging::user_ref(user_id_i64), true)],
+        )
+        .await;
+    }
+}
+
+async fn reply_modal_ephemeral(ctx: &Context, modal: &serenity::all::ModalInteraction, content: &str) {
+    let msg = CreateInteractionResponseMessage::new().content(content).ephemeral(true);
+    let _ = modal.create_response(&ctx.http, CreateInteractionResponse::Message(msg)).await;
+}
+
+async fn reply_modal_followup(ctx: &Context, modal: &serenity::all::ModalInteraction, content: &str) {
+    let msg = serenity::all::CreateInteractionResponseFollowup::new().content(content).ephemeral(true);
+    let _ = modal.create_followup(&ctx.http, msg).await;
+}
