@@ -195,7 +195,8 @@ async fn handle_panic_channel(
     match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
         Ok(true) => {}
         Ok(false) => {
-            return reply_ephemeral(ctx, cmd, "You need to be a bot admin to use this command.").await
+            return reply_ephemeral(ctx, cmd, "You need to be a bot admin to use this command.")
+                .await
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to check bot admin status");
