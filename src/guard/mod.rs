@@ -1,7 +1,18 @@
 pub mod audit_handler;
+pub mod backfill;
 pub mod baseline;
 pub mod reaction;
 pub mod sweep;
+
+pub const LOCKDOWN_ENABLED_KEY: &str = "lockdown_enabled";
+pub const LOCKDOWN_ENABLED_DEFAULT: bool = false;
+
+/// Reads the guild's current lockdown state. Callers that can't read this
+/// (a DB error, not "never configured") should fail closed — treat the
+/// error as if lockdown were on, never silently relax guarding.
+pub async fn is_lockdown_enabled(pool: &sqlx::PgPool, guild_id: i64) -> Result<bool, sqlx::Error> {
+    crate::settings::get_bool_setting(pool, guild_id, LOCKDOWN_ENABLED_KEY, LOCKDOWN_ENABLED_DEFAULT).await
+}
 
 /// Every role's permission bitmask is guarded, registered or not — a bare
 /// equality check, but naming it documents the rule and gives it its own
