@@ -46,10 +46,12 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
         // for why reverting one role at a time caused a live oscillation
         // storm. The claim just avoids overlapping with a concurrent
         // gateway-triggered reconciliation; both converge to the same
-        // result, so an overlap would be wasteful, not unsafe.
+        // result, so an overlap would be wasteful, not unsafe. Released
+        // after a short delay so the correction's own echo events don't
+        // immediately re-trigger another round.
         if crate::guard::position_reconcile_guard::try_claim(guild_id_i64) {
             let _ = reaction::reconcile_positions(ctx, pool, guild_id_i64).await;
-            crate::guard::position_reconcile_guard::release(guild_id_i64);
+            crate::guard::position_reconcile_guard::release_after_delay(guild_id_i64, std::time::Duration::from_secs(2));
         }
     }
 

@@ -161,12 +161,15 @@ pub async fn reconcile_positions(ctx: &Context, pool: &PgPool, guild_id_i64: i64
     // Empirical convergence check: Discord returns the authoritative
     // post-change position for every role in the guild. If it echoes back
     // exactly the integers we sent, this correction is final and the next
-    // event should find no drift. If Discord silently normalized any of
-    // them to a different value, comparing against the same absolute
-    // integers will never converge — this is the one thing that decides
-    // whether bulk correction actually fixes absolute position guarding or
-    // just turns per-role oscillation into a slower per-correction one, so
-    // it's logged loudly on every correction rather than assumed.
+    // event should find no drift. A mismatch here is expected and transient
+    // during a handful of known windows — e.g. an unauthorized role create
+    // under lockdown (an extra un-baselined role briefly exists, so
+    // `targets` is short by one and Discord renormalizes around it) or the
+    // gap between a role being deleted and recreated — and self-heals once
+    // the role count settles back to what baselines expect, so it's logged
+    // as a warning to investigate, not an error implying the design is
+    // broken. Only a mismatch that persists across repeated corrections
+    // would indicate absolute position guarding genuinely can't converge.
     let mut mismatches = Vec::new();
     for (role_id_i64, sent_position) in &targets {
         if let Some(returned_role) = returned.iter().find(|r| r.id.get() as i64 == *role_id_i64) {
@@ -178,7 +181,7 @@ pub async fn reconcile_positions(ctx: &Context, pool: &PgPool, guild_id_i64: i64
     if mismatches.is_empty() {
         tracing::info!(guild_id = guild_id_i64, "guard: bulk position correction confirmed — Discord echoed back exactly the positions sent");
     } else {
-        tracing::error!(guild_id = guild_id_i64, ?mismatches, "guard: Discord returned DIFFERENT positions than sent — absolute position guarding cannot converge, this will keep re-triggering");
+        tracing::warn!(guild_id = guild_id_i64, ?mismatches, "guard: Discord returned different positions than sent — expected during a transient role-count-mismatch window (e.g. a create/delete in flight); investigate if this repeats without one");
     }
 
     let embed = serenity::all::CreateEmbed::new()

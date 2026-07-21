@@ -26,3 +26,20 @@ pub fn try_claim(guild_id_i64: i64) -> bool {
 pub fn release(guild_id_i64: i64) {
     set().lock().unwrap().remove(&guild_id_i64);
 }
+
+/// Releases a claim after a short delay instead of immediately. A bulk
+/// position correction generates its own `guild_role_update` echo for every
+/// role it moved, delivered asynchronously — releasing the claim right away
+/// (before those echoes land) lets each one independently re-scan a
+/// still-settling cache and fire its own redundant bulk correction. Holding
+/// the claim a couple seconds longer absorbs that whole echo burst as one
+/// correction instead of several; it's not required for correctness (each
+/// redundant correction still converges to the same baseline-derived
+/// target), just for not spamming the log channel with duplicate "Role
+/// Positions Reconciled" entries for what was really one reorder.
+pub fn release_after_delay(guild_id_i64: i64, delay: std::time::Duration) {
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        release(guild_id_i64);
+    });
+}

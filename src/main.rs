@@ -145,10 +145,12 @@ impl EventHandler for Handler {
         // doc comment above. The claim prevents the burst of
         // guild_role_update events from one reorder (every role Discord
         // shifts fires its own event) from each recomputing and firing a
-        // redundant bulk correction.
+        // redundant bulk correction; releasing it after a short delay
+        // (rather than immediately) absorbs the correction's own echo
+        // events too, instead of one of them re-triggering another round.
         if guard::position_reconcile_guard::try_claim(guild_id_i64) {
             let _ = guard::reaction::reconcile_positions(&ctx, &self.pool, guild_id_i64).await;
-            guard::position_reconcile_guard::release(guild_id_i64);
+            guard::position_reconcile_guard::release_after_delay(guild_id_i64, std::time::Duration::from_secs(2));
         }
     }
 
