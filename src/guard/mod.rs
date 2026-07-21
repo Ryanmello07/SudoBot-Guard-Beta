@@ -1,4 +1,5 @@
 pub mod baseline;
+pub mod reaction;
 
 /// Every role's permission bitmask is guarded, registered or not — a bare
 /// equality check, but naming it documents the rule and gives it its own
