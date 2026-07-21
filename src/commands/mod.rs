@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod enroll;
 pub mod lockdown;
+pub mod panic;
 pub mod protect;
 pub mod settings;
 pub mod setup;
