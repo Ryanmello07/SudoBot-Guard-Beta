@@ -1,4 +1,4 @@
-use crate::guard::{baseline, is_manual_grant, reaction};
+use crate::guard::{baseline, is_manual_grant, name_drifted, permission_drifted, position_drifted, reaction};
 use serenity::all::Context;
 use serenity::model::guild::audit_log::{Action, AuditLogEntry, Change, MemberAction, RoleAction};
 use sqlx::PgPool;
@@ -16,18 +16,86 @@ pub async fn handle_entry(
 
     match entry.action {
         Action::Role(RoleAction::Create) => handle_role_create(ctx, pool, guild_id_i64, entry).await,
-        // RoleAction::Update (permission/name/position drift) is handled by
-        // main.rs's guild_role_update instead — the raw gateway event, not
-        // this audit-log path. It used to live here too, as a slower backup;
-        // live testing showed both paths firing for the same edit (a real
-        // double Discord API call and a duplicate log entry, not just
-        // redundant checking), so this path was removed rather than kept.
+        Action::Role(RoleAction::Update) => handle_role_update(ctx, pool, guild_id_i64, entry).await,
         Action::Role(RoleAction::Delete) => handle_role_delete(ctx, pool, guild_id_i64, entry).await,
         Action::Member(MemberAction::RoleUpdate) => {
             handle_member_role_update(ctx, pool, guild_id_i64, entry).await
         }
         _ => {}
     }
+}
+
+/// Quarantines the actor behind a permission/name/position edit — nothing
+/// else. The actual revert already happened, instantly, via the raw gateway
+/// event in `main.rs`'s `guild_role_update` (which has no actor info to
+/// quarantine with). This path exists purely to attribute the edit to
+/// whoever made it (only the audit log carries that) and act on it; it must
+/// never call any `revert_*` function itself — doing so reintroduces the
+/// exact double-revert bug that got this path removed in the first place.
+///
+/// Detection compares the audit entry's own recorded `new` values against
+/// the baseline, not the role's current live state — by the time this
+/// (slower) audit-log entry arrives, the gateway path has typically already
+/// reverted it, so live state would show no drift even though a violation
+/// genuinely occurred.
+async fn handle_role_update(ctx: &Context, pool: &PgPool, guild_id_i64: i64, entry: &AuditLogEntry) {
+    let lockdown_enabled = crate::guard::is_lockdown_enabled(pool, guild_id_i64).await.unwrap_or(true);
+    if !lockdown_enabled {
+        return; // matches guild_role_update's own gate: not enforced, not a violation
+    }
+
+    let Some(target_id) = entry.target_id else { return };
+    let role_id_i64 = target_id.get() as i64;
+
+    let Ok(Some(base)) = baseline::get_baseline(pool, guild_id_i64, role_id_i64).await else {
+        return;
+    };
+
+    let Some(changes) = &entry.changes else { return };
+    let mut violated = false;
+    for change in changes {
+        match change {
+            Change::Permissions { new: Some(new_perms), .. } => {
+                if permission_drifted(base.permissions, new_perms.bits() as i64) {
+                    violated = true;
+                }
+            }
+            Change::Name { new: Some(new_name), .. } => {
+                if let Some(baseline_name) = &base.name {
+                    if name_drifted(baseline_name, new_name) {
+                        violated = true;
+                    }
+                }
+            }
+            Change::Position { new: Some(new_position), .. } => {
+                if let Some(baseline_position) = base.position {
+                    if position_drifted(baseline_position, *new_position as i32) {
+                        violated = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !violated {
+        return;
+    }
+
+    let actor_id_i64 = entry.user_id.get() as i64;
+    let stripped = reaction::quarantine_actor(ctx, pool, guild_id_i64, actor_id_i64).await.unwrap_or_default();
+    if stripped.is_empty() {
+        // Nothing to report — the revert was already logged separately by
+        // guild_role_update. Don't add a second embed saying nothing happened.
+        return;
+    }
+
+    let embed = serenity::all::CreateEmbed::new()
+        .title("Actor Quarantined (Role Tampering)")
+        .field("Role", crate::logging::role_ref(role_id_i64), true)
+        .field("Actor", crate::logging::user_ref(actor_id_i64), true)
+        .field("Quarantine", "The actor's own active session(s) were quarantined.", false)
+        .color(0xED4245);
+    let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Alert, embed).await;
 }
 
 /// Reverts a role *creation* the same way other unauthorized changes get
@@ -62,15 +130,24 @@ async fn handle_role_create(ctx: &Context, pool: &PgPool, guild_id_i64: i64, ent
         tracing::error!(error = ?e, guild_id = guild_id_i64, role_id = role_id_i64, "guard: failed to remove baseline for role deleted after lockdown creation");
     }
 
+    let actor_id_i64 = entry.user_id.get() as i64;
+    let stripped = reaction::quarantine_actor(ctx, pool, guild_id_i64, actor_id_i64).await.unwrap_or_default();
+    let quarantine_note = if stripped.is_empty() {
+        "No sessions quarantined (the creator had none active, or quarantine-on-violation is off)."
+    } else {
+        "The creator's own active session(s) were quarantined."
+    };
+
     let embed = serenity::all::CreateEmbed::new()
         .title("Role Creation Reverted (Lockdown)")
         .field("Role", crate::logging::role_ref_deleted(role_id_i64), true)
-        .field("Created By", crate::logging::user_ref(entry.user_id.get() as i64), true)
+        .field("Created By", crate::logging::user_ref(actor_id_i64), true)
         .field(
             "Reason",
             "The role was created while lockdown was active — deleted. Lockdown treats the role list as frozen.",
             false,
         )
+        .field("Quarantine", quarantine_note, false)
         .color(0xED4245);
     let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Alert, embed).await;
 }
@@ -101,7 +178,16 @@ async fn handle_role_delete(ctx: &Context, pool: &PgPool, guild_id_i64: i64, ent
         crate::guard::recreation_guard::release(guild_id_i64, role_id_i64);
         return;
     };
-    let _ = reaction::recreate_role(ctx, pool, guild_id_i64, role_id_i64, &base, is_registered).await;
+    let _ = reaction::recreate_role(
+        ctx,
+        pool,
+        guild_id_i64,
+        role_id_i64,
+        &base,
+        is_registered,
+        Some(entry.user_id.get() as i64),
+    )
+    .await;
     crate::guard::recreation_guard::release(guild_id_i64, role_id_i64);
 }
 
@@ -125,11 +211,11 @@ async fn handle_member_role_update(ctx: &Context, pool: &PgPool, guild_id_i64: i
 
                     let quarantine_note = if stripped.is_empty() {
                         // An empty result can't distinguish "granter had no
-                        // active sessions" from "quarantine-on-manual-grant is
+                        // active sessions" from "quarantine-on-violation is
                         // off" without a new query, which is out of scope —
                         // so state both possibilities honestly rather than
                         // assert one we can't verify.
-                        "No sessions quarantined (the granter had none active, or quarantine-on-manual-grant is off).".to_string()
+                        "No sessions quarantined (the granter had none active, or quarantine-on-violation is off).".to_string()
                     } else {
                         "The granter's own active session(s) were quarantined.".to_string()
                     };

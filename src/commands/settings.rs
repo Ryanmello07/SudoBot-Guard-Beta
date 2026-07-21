@@ -40,7 +40,7 @@ pub fn commands() -> Vec<CreateCommand> {
                     )
                     .add_string_choice(
                         "quarantine_on_manual_grant",
-                        crate::settings::QUARANTINE_ON_MANUAL_GRANT_KEY,
+                        crate::settings::QUARANTINE_ON_VIOLATION_KEY,
                     ),
                 )
                 .add_sub_option(

@@ -78,7 +78,9 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
                     .await
                     .unwrap_or(false);
                 if let Ok(Some(base)) = baseline::get_baseline(pool, guild_id_i64, row.role_id).await {
-                    let _ = reaction::recreate_role(ctx, pool, guild_id_i64, row.role_id, &base, is_registered).await;
+                    // No actor to quarantine — this recreation isn't driven
+                    // by any audit-log entry, so there's no known deleter.
+                    let _ = reaction::recreate_role(ctx, pool, guild_id_i64, row.role_id, &base, is_registered, None).await;
                 }
                 crate::guard::recreation_guard::release(guild_id_i64, row.role_id);
             }

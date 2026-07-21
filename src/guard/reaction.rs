@@ -121,8 +121,8 @@ pub async fn quarantine_actor(
     let enabled = settings::get_bool_setting(
         pool,
         guild_id_i64,
-        settings::QUARANTINE_ON_MANUAL_GRANT_KEY,
-        settings::QUARANTINE_ON_MANUAL_GRANT_DEFAULT,
+        settings::QUARANTINE_ON_VIOLATION_KEY,
+        settings::QUARANTINE_ON_VIOLATION_DEFAULT,
     )
     .await?;
     if !enabled {
@@ -163,6 +163,11 @@ pub async fn quarantine_actor(
     Ok(stripped)
 }
 
+/// `actor_id`: `Some(user_id)` when the deletion was attributed to someone
+/// via the audit log (the reactive `handle_role_delete` path) — that actor's
+/// own sessions get quarantined too, so they can't just keep deleting the
+/// role back. `None` when there's no known actor (the periodic sweep's
+/// recreation path, which isn't driven by any audit-log entry).
 pub async fn recreate_role(
     ctx: &Context,
     pool: &PgPool,
@@ -170,6 +175,7 @@ pub async fn recreate_role(
     old_role_id_i64: i64,
     baseline: &crate::guard::baseline::RoleBaseline,
     is_registered: bool,
+    actor_id: Option<i64>,
 ) -> Result<serenity::model::guild::Role, serenity::Error> {
     let guild_id = GuildId::new(guild_id_i64 as u64);
     let name = baseline.name.as_deref().unwrap_or("recreated-role");
@@ -226,7 +232,7 @@ pub async fn recreate_role(
         tracing::error!(error = ?e, guild_id = guild_id_i64, old_role_id = old_role_id_i64, new_role_id = new_role.id.get() as i64, "guard: failed to delete old baseline after role recreation");
     }
 
-    let embed = serenity::all::CreateEmbed::new()
+    let mut embed = serenity::all::CreateEmbed::new()
         .title(if is_registered { "Registered role recreated" } else { "Role recreated (lockdown)" })
         .field("Old Role", role_ref_deleted(old_role_id_i64), true)
         .field("New Role", role_ref(new_role.id.get() as i64), true)
@@ -234,8 +240,19 @@ pub async fn recreate_role(
             "Note",
             "The role was deleted and has been recreated from its guarded baseline. Re-check any external references to the old role ID.",
             false,
-        )
-        .color(0xED4245);
+        );
+    if let Some(actor_id_i64) = actor_id {
+        let stripped = quarantine_actor(ctx, pool, guild_id_i64, actor_id_i64).await.unwrap_or_default();
+        let quarantine_note = if stripped.is_empty() {
+            "No sessions quarantined (the deleter had none active, or quarantine-on-violation is off)."
+        } else {
+            "The deleter's own active session(s) were quarantined."
+        };
+        embed = embed
+            .field("Deleted By", crate::logging::user_ref(actor_id_i64), true)
+            .field("Quarantine", quarantine_note, false);
+    }
+    let embed = embed.color(0xED4245);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
     Ok(new_role)
 }

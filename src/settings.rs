@@ -12,8 +12,8 @@ pub const ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_DEFAULT: i64 = 1440;
 /// with no realistic legitimate use case anywhere close to this ceiling.
 pub const MAX_SETTING_MINUTES: i64 = 43_200;
 
-pub const QUARANTINE_ON_MANUAL_GRANT_KEY: &str = "quarantine_on_manual_grant";
-pub const QUARANTINE_ON_MANUAL_GRANT_DEFAULT: bool = true;
+pub const QUARANTINE_ON_VIOLATION_KEY: &str = "quarantine_on_violation";
+pub const QUARANTINE_ON_VIOLATION_DEFAULT: bool = true;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum SettingKind {
@@ -48,10 +48,10 @@ pub const SETTINGS_REGISTRY: &[SettingDefinition] = &[
         default: ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_DEFAULT,
     },
     SettingDefinition {
-        key: QUARANTINE_ON_MANUAL_GRANT_KEY,
-        description: "When a registered permission role is granted manually (outside the bot), also strip the granter's own active sessions. Set to false to only revert the grant, without quarantining the granter.",
+        key: QUARANTINE_ON_VIOLATION_KEY,
+        description: "When a guard violation is caught and attributed to an actor (a manual permission grant, a permission/name/position edit, or a role delete/create while guarded), also strip that actor's own active sessions. Set to false to only revert the violation, without quarantining the actor.",
         kind: SettingKind::Bool,
-        default: QUARANTINE_ON_MANUAL_GRANT_DEFAULT as i64,
+        default: QUARANTINE_ON_VIOLATION_DEFAULT as i64,
     },
 ];
 
@@ -221,27 +221,27 @@ mod tests {
 
     #[test]
     fn accepts_true_for_bool_setting() {
-        assert_eq!(validate_setting(QUARANTINE_ON_MANUAL_GRANT_KEY, "true"), Ok(()));
+        assert_eq!(validate_setting(QUARANTINE_ON_VIOLATION_KEY, "true"), Ok(()));
     }
 
     #[test]
     fn accepts_false_for_bool_setting() {
-        assert_eq!(validate_setting(QUARANTINE_ON_MANUAL_GRANT_KEY, "false"), Ok(()));
+        assert_eq!(validate_setting(QUARANTINE_ON_VIOLATION_KEY, "false"), Ok(()));
     }
 
     #[test]
     fn accepts_mixed_case_bool_value() {
-        assert_eq!(validate_setting(QUARANTINE_ON_MANUAL_GRANT_KEY, "True"), Ok(()));
+        assert_eq!(validate_setting(QUARANTINE_ON_VIOLATION_KEY, "True"), Ok(()));
     }
 
     #[test]
     fn rejects_non_bool_value_for_bool_setting() {
-        assert!(validate_setting(QUARANTINE_ON_MANUAL_GRANT_KEY, "1440").is_err());
+        assert!(validate_setting(QUARANTINE_ON_VIOLATION_KEY, "1440").is_err());
     }
 
     #[test]
     fn registry_contains_quarantine_key() {
         let keys: Vec<&str> = SETTINGS_REGISTRY.iter().map(|s| s.key).collect();
-        assert!(keys.contains(&QUARANTINE_ON_MANUAL_GRANT_KEY));
+        assert!(keys.contains(&QUARANTINE_ON_VIOLATION_KEY));
     }
 }
