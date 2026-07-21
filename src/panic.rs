@@ -3,7 +3,17 @@ use serenity::all::{
     ButtonStyle, ChannelId, Context, CreateActionRow, CreateButton, CreateEmbed, CreateMessage,
     EditMessage, GuildId, RoleId, UserId,
 };
+use serenity::futures::StreamExt;
 use sqlx::PgPool;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum TallyError {
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("failed to list guild members: {0}")]
+    Discord(#[from] serenity::Error),
+}
 
 /// True if the member (given their current role IDs) holds either half of
 /// any registered role pair — the standard identity role or the permission
@@ -202,24 +212,72 @@ pub async fn cancel_vote(pool: &PgPool, guild_id_i64: i64, voter_id_i64: i64) ->
     Ok(())
 }
 
-/// (yes_votes, total_eligible) computed live: total_eligible is every
-/// currently-cached member holding any `voter_roles` role; yes_votes is how
-/// many of THOSE members have also cast a vote. A stored vote from someone
-/// who no longer holds a voter role doesn't count — eligibility is always
-/// "currently," never "at the time they voted."
-pub async fn tally(ctx: &Context, pool: &PgPool, guild_id: GuildId) -> Result<(i64, i64), sqlx::Error> {
+/// Every member ID currently holding any `voter_roles` role, fetched via a
+/// live REST member listing rather than the gateway's member cache. The
+/// cache only reflects whichever members Discord happened to have sent
+/// (online members, or ones the bot has otherwise observed) unless the bot
+/// explicitly requested a full member-list chunk — for a rare, human-paced,
+/// security-critical operation like this, a real API call per vote is the
+/// right trade: a live incident showed the cache silently under-counting
+/// eligible voters (two members with the same voter role, only one of them
+/// counted), which directly corrupts the majority threshold this whole
+/// feature depends on.
+async fn eligible_voter_ids(ctx: &Context, pool: &PgPool, guild_id: GuildId) -> Result<Vec<i64>, TallyError> {
     let guild_id_i64 = guild_id.get() as i64;
     let voter_roles = voter_role_ids(pool, guild_id_i64).await?;
-    let Some(guild) = ctx.cache.guild(guild_id).map(|g| g.clone()) else {
-        return Ok((0, 0));
-    };
+    if voter_roles.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    let eligible_ids: Vec<i64> = guild
-        .members
-        .values()
-        .filter(|m| m.roles.iter().any(|r| voter_roles.contains(&(r.get() as i64))))
-        .map(|m| m.user.id.get() as i64)
-        .collect();
+    let mut eligible_ids = Vec::new();
+    let mut members = guild_id.members_iter(&ctx.http).boxed();
+    while let Some(member_result) = members.next().await {
+        match member_result {
+            Ok(member) => {
+                if member.roles.iter().any(|r| voter_roles.contains(&(r.get() as i64))) {
+                    eligible_ids.push(member.user.id.get() as i64);
+                }
+            }
+            Err(e) => {
+                // Fail closed: a partial member list understates total_eligible,
+                // which makes majority_reached easier to satisfy — the same
+                // undercounting failure this function exists to fix, reintroduced
+                // through a different door. Propagate instead of continuing.
+                tracing::error!(error = ?e, %guild_id, "panic: failed to fetch a page of guild members while computing eligible voters");
+                return Err(TallyError::Discord(e));
+            }
+        }
+    }
+    Ok(eligible_ids)
+}
+
+/// True if `user_id_i64` is currently in the guild and holds any
+/// `voter_roles` role — checked live via REST, matching `tally`'s ground
+/// truth exactly, so a "you're not eligible" reply is never based on stale
+/// cache data.
+pub async fn is_eligible_voter(ctx: &Context, pool: &PgPool, guild_id: GuildId, user_id_i64: i64) -> bool {
+    let guild_id_i64 = guild_id.get() as i64;
+    let Ok(voter_roles) = voter_role_ids(pool, guild_id_i64).await else {
+        return false;
+    };
+    if voter_roles.is_empty() {
+        return false;
+    }
+    let Ok(member) = guild_id.member(&ctx.http, UserId::new(user_id_i64 as u64)).await else {
+        return false;
+    };
+    member.roles.iter().any(|r| voter_roles.contains(&(r.get() as i64)))
+}
+
+/// (yes_votes, total_eligible) computed live: total_eligible is every
+/// member CURRENTLY holding any `voter_roles` role (via a real member
+/// listing, not the gateway cache — see `eligible_voter_ids`); yes_votes is
+/// how many of THOSE members have also cast a vote. A stored vote from
+/// someone who no longer holds a voter role doesn't count — eligibility is
+/// always "currently," never "at the time they voted."
+pub async fn tally(ctx: &Context, pool: &PgPool, guild_id: GuildId) -> Result<(i64, i64), TallyError> {
+    let guild_id_i64 = guild_id.get() as i64;
+    let eligible_ids = eligible_voter_ids(ctx, pool, guild_id).await?;
 
     if eligible_ids.is_empty() {
         return Ok((0, 0));

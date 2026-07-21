@@ -136,6 +136,14 @@ async fn handle_vote(
         }
     }
 
+    // A vote from someone who doesn't hold a voter_roles role is accepted by
+    // cast_vote (it doesn't check) but silently never counts in tally() --
+    // without this check the caller gets a false "recorded" confirmation
+    // with no indication their vote is invisible to the majority threshold.
+    if !panic::is_eligible_voter(ctx, pool, guild_id, user_id_i64).await {
+        return reply_followup(ctx, cmd, "You don't hold an eligible voter role, so your vote won't count toward ending panic mode.").await;
+    }
+
     if let Err(e) = panic::cast_vote(pool, guild_id_i64, user_id_i64).await {
         tracing::error!(error = ?e, "calm: failed to record vote");
         return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
@@ -175,6 +183,13 @@ async fn handle_cancel(
             tracing::error!(error = ?e, "calm: failed to recheck panic active state before cancel");
             return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
+    }
+
+    // Matches handle_vote's eligibility check -- an ineligible caller never
+    // had a counted vote to retract, so tell them plainly instead of a
+    // misleading "retracted" confirmation.
+    if !panic::is_eligible_voter(ctx, pool, guild_id, user_id_i64).await {
+        return reply_followup(ctx, cmd, "You don't hold an eligible voter role, so you don't have a counted vote to retract.").await;
     }
 
     if let Err(e) = panic::cancel_vote(pool, guild_id_i64, user_id_i64).await {
@@ -351,6 +366,18 @@ pub async fn handle_modal(
             tracing::error!(error = ?e, "calm: failed to recheck panic active state before modal action");
             return reply_modal_followup(ctx, modal, "Something went wrong. Try again later.").await;
         }
+    }
+
+    // Matches the slash-command handlers' eligibility check -- guards both
+    // branches below, since neither a vote nor a cancel from someone without
+    // a voter_roles role should get a confirmation implying it counted.
+    if !panic::is_eligible_voter(ctx, pool, guild_id, user_id_i64).await {
+        let msg = if modal.data.custom_id == "panic_vote_modal" {
+            "You don't hold an eligible voter role, so your vote won't count toward ending panic mode."
+        } else {
+            "You don't hold an eligible voter role, so you don't have a counted vote to retract."
+        };
+        return reply_modal_followup(ctx, modal, msg).await;
     }
 
     if modal.data.custom_id == "panic_vote_modal" {
