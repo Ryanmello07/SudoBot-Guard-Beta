@@ -1,3 +1,4 @@
+pub mod audit_handler;
 pub mod baseline;
 pub mod reaction;
 

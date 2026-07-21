@@ -17,6 +17,7 @@ use serenity::async_trait;
 use serenity::model::gateway::Ready;
 use serenity::prelude::*;
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ struct Handler {
     initial_bot_admin_id: Option<u64>,
     encryption_key: [u8; 32],
     yubico: yubico::YubicoClient,
+    bot_user_id: AtomicU64,
 }
 
 impl Handler {
@@ -54,6 +56,7 @@ impl Handler {
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         tracing::info!(bot_name = %ready.user.name, "connected and ready");
+        self.bot_user_id.store(ready.user.id.get(), Ordering::Relaxed);
         for guild in &ready.guilds {
             self.setup_guild(&ctx, guild.id).await;
         }
@@ -97,6 +100,22 @@ impl EventHandler for Handler {
             }
             _ => {}
         }
+    }
+
+    async fn guild_audit_log_entry_create(
+        &self,
+        ctx: Context,
+        entry: serenity::model::guild::audit_log::AuditLogEntry,
+        guild_id: GuildId,
+    ) {
+        guard::audit_handler::handle_entry(
+            &ctx,
+            &self.pool,
+            guild_id.get() as i64,
+            &entry,
+            self.bot_user_id.load(Ordering::Relaxed),
+        )
+        .await;
     }
 }
 
@@ -201,13 +220,14 @@ async fn main() {
 
     let yubico = yubico::YubicoClient::new(config.yubico_client_id.clone(), &config.yubico_secret_key);
 
-    let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MEMBERS;
+    let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MEMBERS | GatewayIntents::GUILD_MODERATION;
     let mut client = Client::builder(&config.discord_token, intents)
         .event_handler(Handler {
             pool: pool.clone(),
             initial_bot_admin_id: config.initial_bot_admin_id,
             encryption_key: config.encryption_key,
             yubico,
+            bot_user_id: AtomicU64::new(0),
         })
         .await
         .expect("failed to create Discord client — check DISCORD_TOKEN");
