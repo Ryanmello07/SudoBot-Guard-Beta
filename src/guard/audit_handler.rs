@@ -36,7 +36,14 @@ async fn handle_role_update(ctx: &Context, pool: &PgPool, guild_id_i64: i64, ent
         }
     };
     let Ok(Some(base)) = baseline::get_baseline(pool, guild_id_i64, role_id_i64).await else {
-        return; // no baseline captured yet — reconciliation sweep will backfill it
+        // No baseline yet means this role predates both the startup backfill
+        // and guild_role_create's on-creation capture ever running against
+        // it (e.g. the bot hasn't restarted since the role was created, and
+        // guild_role_create's handler wasn't wired up at role-creation time
+        // for some reason). The reconciliation sweep does NOT backfill this —
+        // it explicitly skips roles with no baseline — so this role stays
+        // unguarded until the next startup backfill runs.
+        return;
     };
 
     let Some(changes) = &entry.changes else { return };

@@ -55,6 +55,32 @@ pub async fn upsert_baseline(
     Ok(())
 }
 
+/// Updates only `name` and `position` on an existing baseline row, leaving
+/// `permissions` untouched. Used when a role that already has a
+/// permissions-only baseline (captured at some prior startup, before it was
+/// ever registered) gets registered via `/protect add` — at that moment its
+/// name/position need to be captured for the first time, but its
+/// `permissions` value is already trusted and must not be reset to whatever
+/// the role's live permissions happen to be at this instant.
+pub async fn update_registration_metadata(
+    pool: &PgPool,
+    guild_id: i64,
+    role_id: i64,
+    name: Option<&str>,
+    position: Option<i32>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "UPDATE role_baselines SET name = $3, position = $4, updated_at = now() WHERE guild_id = $1 AND role_id = $2",
+        guild_id,
+        role_id,
+        name,
+        position
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn is_registered_role(
     pool: &PgPool,
     guild_id: i64,

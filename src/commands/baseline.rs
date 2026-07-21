@@ -66,7 +66,10 @@ async fn handle_update(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, s
     let role_id_i64 = role_id.get() as i64;
     let is_registered = crate::guard::baseline::is_registered_role(pool, guild_id_i64, role_id_i64)
         .await
-        .unwrap_or(false);
+        .unwrap_or_else(|e| {
+            tracing::error!(error = ?e, %guild_id, role_id = role_id_i64, "guard: failed to check role registration during baseline update");
+            false
+        });
     let name = is_registered.then(|| role.name.clone());
     let position = is_registered.then_some(role.position as i32);
 

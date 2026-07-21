@@ -135,6 +135,39 @@ impl EventHandler for Handler {
         self.setup_guild(&ctx, guild.id).await;
     }
 
+    /// Captures a baseline for a role the instant it's created, so it's
+    /// guarded from the moment it exists rather than only after the next
+    /// bot restart (or the next sweep tick, which never creates baselines —
+    /// it only compares against ones that already exist). A brand-new role
+    /// is essentially never already registered, but the registration check
+    /// is kept for consistency with how baselines are captured everywhere
+    /// else (startup backfill, `/protect add`, `/baseline update`).
+    async fn guild_role_create(&self, _ctx: Context, new: serenity::model::guild::Role) {
+        let guild_id_i64 = new.guild_id.get() as i64;
+        let role_id_i64 = new.id.get() as i64;
+        let is_registered = guard::baseline::is_registered_role(&self.pool, guild_id_i64, role_id_i64)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = ?e, guild_id = guild_id_i64, role_id = role_id_i64, "guard: failed to check role registration for new role");
+                false
+            });
+        let name = is_registered.then(|| new.name.clone());
+        let position = is_registered.then_some(new.position as i32);
+        if let Err(e) = guard::baseline::upsert_baseline(
+            &self.pool,
+            guild_id_i64,
+            role_id_i64,
+            new.permissions.bits() as i64,
+            name.as_deref(),
+            position,
+            None,
+        )
+        .await
+        {
+            tracing::error!(error = ?e, guild_id = guild_id_i64, role_id = role_id_i64, "guard: failed to capture baseline for newly created role");
+        }
+    }
+
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
             Interaction::Command(cmd) => match cmd.data.name.as_str() {

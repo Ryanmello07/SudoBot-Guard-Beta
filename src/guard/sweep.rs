@@ -42,6 +42,15 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
     }
 
     // 2. Registered roles that no longer exist among the guild's live roles.
+    //
+    // Known edge case (not architecturally fixed here): if a registered role
+    // is deleted and the reactive handler (`audit_handler::handle_role_delete`
+    // -> `reaction::recreate_role`) recreates it right as a sweep tick reads
+    // `role_pairs`/`role_baselines` below, there's a narrow race where this
+    // sweep could still see the not-yet-repointed old role ID, find it
+    // missing from the live guild, and attempt a second recreation. Low
+    // probability given the 5-minute sweep cadence versus the sub-second
+    // window the race requires.
     if let Ok(rows) = sqlx::query!(
         "SELECT DISTINCT role_id FROM role_baselines
          WHERE guild_id = $1 AND role_id IN (
@@ -72,6 +81,13 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
     };
     for permission_role_id_i64 in registered {
         let role_id = serenity::all::RoleId::new(permission_role_id_i64 as u64);
+        // `guild.members` is the gateway's member cache, not a REST fetch of
+        // every member — above Discord's large-guild threshold (~250
+        // members without full member-list chunking enabled), some members
+        // may not be cached. This is a known scope limitation, deliberate
+        // per the original design to keep the sweep cheap, not a bug: it
+        // means this orphaned-grant safety net could miss a manually-granted
+        // role held by an uncached member.
         for member in guild.members.values() {
             if !member.roles.contains(&role_id) {
                 continue;

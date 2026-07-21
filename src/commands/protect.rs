@@ -243,15 +243,33 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
     ] {
         let role_id_i64 = role_id.get() as i64;
 
-        // Only backfill if no baseline exists yet — never overwrite an
-        // existing one. A baseline may already exist from the startup
-        // backfill, or from a prior `/protect add` on this same role before
-        // a `/protect remove` + re-add. Unconditionally upserting here would
-        // silently replace the previously-trusted baseline with whatever the
-        // role's live permissions happen to be at this exact instant, which
-        // could bake in an in-flight tamper as the new "trusted" state.
+        // A baseline may already exist from the startup backfill (permissions
+        // only, since the role wasn't registered yet), or from a prior
+        // `/protect add` on this same role before a `/protect remove` +
+        // re-add. Either way, its `permissions` value is already trusted and
+        // must not be reset to whatever the role's live permissions happen to
+        // be at this exact instant — that could bake in an in-flight tamper
+        // as the new "trusted" state. But name/position, which only ever get
+        // captured for *registered* roles, are supposed to be backfilled
+        // right now — so when a baseline already exists, only update those
+        // two fields instead of skipping entirely.
+        let position = guild.roles.get(&role_id).map(|r| r.position as i32);
+        let permissions = guild.roles.get(&role_id).map(|r| r.permissions.bits() as i64).unwrap_or(0);
         match crate::guard::baseline::get_baseline(pool, guild_id_i64, role_id_i64).await {
-            Ok(Some(_)) => continue, // already has a baseline — don't touch it
+            Ok(Some(_)) => {
+                if let Err(e) = crate::guard::baseline::update_registration_metadata(
+                    pool,
+                    guild_id_i64,
+                    role_id_i64,
+                    role_name.as_deref(),
+                    position,
+                )
+                .await
+                {
+                    tracing::error!(error = ?e, %guild_id, role_id = role_id_i64, "guard: failed to backfill baseline on registration");
+                }
+                continue;
+            }
             Ok(None) => {}
             Err(e) => {
                 tracing::error!(error = ?e, %guild_id, role_id = role_id_i64, "guard: failed to check baseline before registration backfill");
@@ -259,8 +277,6 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
             }
         }
 
-        let position = guild.roles.get(&role_id).map(|r| r.position as i32);
-        let permissions = guild.roles.get(&role_id).map(|r| r.permissions.bits() as i64).unwrap_or(0);
         if let Err(e) = crate::guard::baseline::upsert_baseline(
             pool,
             guild_id_i64,

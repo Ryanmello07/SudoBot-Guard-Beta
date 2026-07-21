@@ -116,7 +116,15 @@ pub async fn get_bool_setting(
     .fetch_optional(pool)
     .await?;
     Ok(row
-        .map(|r| r.value.eq_ignore_ascii_case("true"))
+        .and_then(|r| {
+            if r.value.eq_ignore_ascii_case("true") {
+                Some(true)
+            } else if r.value.eq_ignore_ascii_case("false") {
+                Some(false)
+            } else {
+                None
+            }
+        })
         .unwrap_or(default))
 }
 
