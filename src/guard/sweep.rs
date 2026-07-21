@@ -44,7 +44,10 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
         }
     }
 
-    // 2. Registered roles that no longer exist among the guild's live roles.
+    // 2. Roles that no longer exist among the guild's live roles: registered
+    //    roles are always recreated; under lockdown, ANY missing role with a
+    //    baseline is recreated — a full role-set freeze, symmetric with step
+    //    1's create-side revert in audit_handler::handle_role_create.
     //
     // `recreation_guard` prevents this from double-recreating a role that
     // the reactive handler (`audit_handler::handle_role_delete` ->
@@ -53,12 +56,14 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
     // recreations 268ms apart) and is now closed by an explicit claim.
     if let Ok(rows) = sqlx::query!(
         "SELECT DISTINCT role_id FROM role_baselines
-         WHERE guild_id = $1 AND role_id IN (
-             SELECT standard_role_id FROM role_pairs WHERE guild_id = $1
-             UNION
-             SELECT permission_role_id FROM role_pairs WHERE guild_id = $1
-         )",
-        guild_id_i64
+         WHERE guild_id = $1
+           AND ($2 OR role_id IN (
+               SELECT standard_role_id FROM role_pairs WHERE guild_id = $1
+               UNION
+               SELECT permission_role_id FROM role_pairs WHERE guild_id = $1
+           ))",
+        guild_id_i64,
+        lockdown_enabled
     )
     .fetch_all(pool)
     .await
@@ -69,8 +74,11 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
                 if !crate::guard::recreation_guard::try_claim(guild_id_i64, row.role_id) {
                     continue; // reactive handler is already recreating this role
                 }
+                let is_registered = baseline::is_registered_role(pool, guild_id_i64, row.role_id)
+                    .await
+                    .unwrap_or(false);
                 if let Ok(Some(base)) = baseline::get_baseline(pool, guild_id_i64, row.role_id).await {
-                    let _ = reaction::recreate_role(ctx, pool, guild_id_i64, row.role_id, &base).await;
+                    let _ = reaction::recreate_role(ctx, pool, guild_id_i64, row.role_id, &base, is_registered).await;
                 }
                 crate::guard::recreation_guard::release(guild_id_i64, row.role_id);
             }

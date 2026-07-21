@@ -55,4 +55,31 @@ pub async fn sync_role_baselines(
             tracing::error!(error = ?e, %guild_id, role_id = role_id_i64, "guard: failed to sync baseline");
         }
     }
+
+    // `force = true` also reconciles: baseline rows for roles that no
+    // longer exist live (leftovers from a deleted role whose recreation
+    // path failed, or from before `recreate_role` started cleaning up its
+    // own old row) get deleted. Without this, `/lockdown on` would snapshot
+    // "current roles plus every stale baseline ever left behind" instead of
+    // "current roles" — and the sweep's lockdown-wide missing-role check
+    // would then treat every stale row as a role to recreate, forever.
+    // Never run on the `force = false` startup path: a registered role that
+    // was deleted while the bot was offline needs its baseline intact so
+    // the very next sweep tick can recreate it — pruning here would lose it
+    // permanently.
+    if force {
+        let live_role_ids: Vec<i64> = guild.roles.keys().map(|id| id.get() as i64).collect();
+        if live_role_ids.is_empty() {
+            tracing::warn!(%guild_id, "guard: live role set was empty during force resync, skipping stale-baseline prune");
+        } else if let Err(e) = sqlx::query!(
+            "DELETE FROM role_baselines WHERE guild_id = $1 AND role_id <> ALL($2)",
+            guild_id_i64,
+            &live_role_ids
+        )
+        .execute(pool)
+        .await
+        {
+            tracing::error!(error = ?e, %guild_id, "guard: failed to prune stale baselines during force resync");
+        }
+    }
 }

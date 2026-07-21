@@ -133,6 +133,7 @@ pub async fn recreate_role(
     guild_id_i64: i64,
     old_role_id_i64: i64,
     baseline: &crate::guard::baseline::RoleBaseline,
+    is_registered: bool,
 ) -> Result<serenity::model::guild::Role, serenity::Error> {
     let guild_id = GuildId::new(guild_id_i64 as u64);
     let name = baseline.name.as_deref().unwrap_or("recreated-role");
@@ -179,11 +180,21 @@ pub async fn recreate_role(
     {
         tracing::error!(error = ?e, guild_id = guild_id_i64, old_role_id = old_role_id_i64, new_role_id = new_role.id.get() as i64, "guard: failed to upsert role_baselines after role recreation");
     }
+    // The new role gets its own baseline row above, keyed by its own id —
+    // the old row is never updated in place (different role_id), so it must
+    // be deleted explicitly. Leaving it would make the sweep see it as a
+    // still-missing baseline on every future tick and recreate the role
+    // again, unboundedly, once the sweep no longer scopes strictly to
+    // registered roles.
+    if let Err(e) = crate::guard::baseline::delete_baseline(pool, guild_id_i64, old_role_id_i64).await {
+        tracing::error!(error = ?e, guild_id = guild_id_i64, old_role_id = old_role_id_i64, new_role_id = new_role.id.get() as i64, "guard: failed to delete old baseline after role recreation");
+    }
 
     let embed = serenity::all::CreateEmbed::new()
-        .title("Registered role recreated")
+        .title(if is_registered { "Registered role recreated" } else { "Role recreated (lockdown)" })
         .description(format!(
-            "A registered role (previously <@&{old_role_id_i64}>) was deleted and has been recreated as <@&{}>, from its guarded baseline. Re-check any external references to the old role ID.",
+            "{} (previously <@&{old_role_id_i64}>) was deleted and has been recreated as <@&{}>, from its guarded baseline. Re-check any external references to the old role ID.",
+            if is_registered { "A registered role" } else { "A role" },
             new_role.id
         ))
         .color(0xED4245);

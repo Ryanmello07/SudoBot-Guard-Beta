@@ -106,9 +106,23 @@ impl EventHandler for Handler {
     /// it only compares against ones that already exist). Name and position
     /// are captured for every role, not just registered ones — the whole
     /// role list is kept a carbon copy of its baseline state.
+    ///
+    /// Skipped entirely under lockdown: `guard::audit_handler::handle_role_create`
+    /// deletes any newly created role in that state, and event ordering
+    /// between this gateway event and that audit-log-driven one isn't
+    /// guaranteed — capturing a baseline here that outlives the deletion
+    /// would let the sweep "recreate" a role nobody asked to keep. The
+    /// bot's own legitimate recreations (`reaction::recreate_role`) write
+    /// their own baseline directly, independent of this handler.
     async fn guild_role_create(&self, _ctx: Context, new: serenity::model::guild::Role) {
         let guild_id_i64 = new.guild_id.get() as i64;
         let role_id_i64 = new.id.get() as i64;
+
+        let lockdown_enabled = guard::is_lockdown_enabled(&self.pool, guild_id_i64).await.unwrap_or(true);
+        if lockdown_enabled {
+            return;
+        }
+
         if let Err(e) = guard::baseline::upsert_baseline(
             &self.pool,
             guild_id_i64,

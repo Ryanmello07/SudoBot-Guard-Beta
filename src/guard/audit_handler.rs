@@ -115,13 +115,23 @@ async fn handle_role_update(ctx: &Context, pool: &PgPool, guild_id_i64: i64, ent
     }
 }
 
+/// Registered roles are always recreated on deletion. Unregistered roles
+/// are only recreated while lockdown is active — a full role-set freeze,
+/// symmetric with `handle_role_create` reverting new roles under lockdown.
+/// Outside lockdown, deleting an ordinary role is left alone.
 async fn handle_role_delete(ctx: &Context, pool: &PgPool, guild_id_i64: i64, entry: &AuditLogEntry) {
     let Some(target_id) = entry.target_id else { return };
     let role_id_i64 = target_id.get() as i64;
 
-    let Ok(true) = baseline::is_registered_role(pool, guild_id_i64, role_id_i64).await else {
-        return; // not a registered role — deletion is fine, guard doesn't care
-    };
+    let is_registered = baseline::is_registered_role(pool, guild_id_i64, role_id_i64)
+        .await
+        .unwrap_or(false);
+    if !is_registered {
+        let lockdown_enabled = crate::guard::is_lockdown_enabled(pool, guild_id_i64).await.unwrap_or(true);
+        if !lockdown_enabled {
+            return; // not registered, and lockdown isn't active — deletion is fine, guard doesn't care
+        }
+    }
 
     if !crate::guard::recreation_guard::try_claim(guild_id_i64, role_id_i64) {
         return; // already being recreated (a duplicate delivery of this same delete, or the sweep)
@@ -131,7 +141,7 @@ async fn handle_role_delete(ctx: &Context, pool: &PgPool, guild_id_i64: i64, ent
         crate::guard::recreation_guard::release(guild_id_i64, role_id_i64);
         return;
     };
-    let _ = reaction::recreate_role(ctx, pool, guild_id_i64, role_id_i64, &base).await;
+    let _ = reaction::recreate_role(ctx, pool, guild_id_i64, role_id_i64, &base, is_registered).await;
     crate::guard::recreation_guard::release(guild_id_i64, role_id_i64);
 }
 
