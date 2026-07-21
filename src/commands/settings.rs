@@ -37,6 +37,10 @@ pub fn commands() -> Vec<CreateCommand> {
                     .add_string_choice(
                         "admin_regen_completion_window_minutes",
                         crate::settings::ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_KEY,
+                    )
+                    .add_string_choice(
+                        "quarantine_on_manual_grant",
+                        crate::settings::QUARANTINE_ON_MANUAL_GRANT_KEY,
                     ),
                 )
                 .add_sub_option(
@@ -115,12 +119,18 @@ async fn build_settings_embed(pool: &PgPool, guild_id_i64: i64) -> Result<Create
         .color(0x5865F2);
 
     for def in settings::SETTINGS_REGISTRY {
-        let value = settings::get_int_setting(pool, guild_id_i64, def.key, def.default).await?;
-        embed = embed.field(
-            def.key,
-            format!("**{value} minutes** (default: {})\n{}", def.default, def.description),
-            false,
-        );
+        let value_text = match def.kind {
+            settings::SettingKind::Minutes => {
+                let value = settings::get_int_setting(pool, guild_id_i64, def.key, def.default).await?;
+                format!("**{value} minutes** (default: {} minutes)", def.default)
+            }
+            settings::SettingKind::Bool => {
+                let default_bool = def.default != 0;
+                let value = settings::get_bool_setting(pool, guild_id_i64, def.key, default_bool).await?;
+                format!("**{}** (default: {})", if value { "on" } else { "off" }, if default_bool { "on" } else { "off" })
+            }
+        };
+        embed = embed.field(def.key, format!("{value_text}\n{}", def.description), false);
     }
     Ok(embed)
 }
@@ -240,19 +250,33 @@ pub async fn handle_component(ctx: &Context, pool: &PgPool, comp: &ComponentInte
     let Some(def) = settings::SETTINGS_REGISTRY.iter().find(|d| d.key == key) else {
         return reply_component_ephemeral(ctx, comp, "Unknown setting.").await;
     };
-    let current = match settings::get_int_setting(pool, guild_id_i64, def.key, def.default).await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(error = ?e, key = def.key, "failed to read setting");
-            return reply_component_ephemeral(ctx, comp, "Something went wrong. Try again later.").await;
+    let current_text = match def.kind {
+        settings::SettingKind::Minutes => {
+            match settings::get_int_setting(pool, guild_id_i64, def.key, def.default).await {
+                Ok(v) => v.to_string(),
+                Err(e) => {
+                    tracing::error!(error = ?e, key = def.key, "failed to read setting");
+                    return reply_component_ephemeral(ctx, comp, "Something went wrong. Try again later.").await;
+                }
+            }
+        }
+        settings::SettingKind::Bool => {
+            let default_bool = def.default != 0;
+            match settings::get_bool_setting(pool, guild_id_i64, def.key, default_bool).await {
+                Ok(v) => v.to_string(),
+                Err(e) => {
+                    tracing::error!(error = ?e, key = def.key, "failed to read setting");
+                    return reply_component_ephemeral(ctx, comp, "Something went wrong. Try again later.").await;
+                }
+            }
         }
     };
 
     let title: String = format!("Set {key}").chars().take(45).collect();
     let modal = CreateModal::new(format!("{SETTINGS_MODAL_PREFIX}{key}"), title).components(vec![
         CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Short, "New value (minutes)", "value")
-                .value(current.to_string())
+            CreateInputText::new(InputTextStyle::Short, "New value", "value")
+                .value(current_text)
                 .required(true),
         ),
     ]);

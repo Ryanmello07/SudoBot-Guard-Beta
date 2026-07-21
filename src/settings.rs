@@ -12,15 +12,25 @@ pub const ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_DEFAULT: i64 = 1440;
 /// with no realistic legitimate use case anywhere close to this ceiling.
 pub const MAX_SETTING_MINUTES: i64 = 43_200;
 
-/// A single configurable, integer-valued (minutes) server setting: its
-/// storage key, a human-readable description shown in `/settings view`, and
-/// its default when unset. Add new entries here as the bot grows more
-/// configurable rules — `/settings view`, `/settings set`'s choices, and
-/// validation should all derive from this one list rather than duplicating
-/// per-key logic elsewhere.
+pub const QUARANTINE_ON_MANUAL_GRANT_KEY: &str = "quarantine_on_manual_grant";
+pub const QUARANTINE_ON_MANUAL_GRANT_DEFAULT: bool = true;
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum SettingKind {
+    Minutes,
+    Bool,
+}
+
+/// A single configurable server setting: its storage key, a human-readable
+/// description shown in `/settings view`, its kind (which determines how
+/// `validate_setting` parses input and how the UI renders/prefills it), and
+/// its default. For `Bool`-kind settings, `default` is 0 (false) or 1
+/// (true) — kept as `i64` so the struct stays uniform across both kinds
+/// rather than needing an enum-of-defaults.
 pub struct SettingDefinition {
     pub key: &'static str,
     pub description: &'static str,
+    pub kind: SettingKind,
     pub default: i64,
 }
 
@@ -28,33 +38,50 @@ pub const SETTINGS_REGISTRY: &[SettingDefinition] = &[
     SettingDefinition {
         key: ADMIN_REGEN_COOLDOWN_MINUTES_KEY,
         description: "How long a bot admin must wait after requesting a factor regenerate before they're allowed to complete it.",
+        kind: SettingKind::Minutes,
         default: ADMIN_REGEN_COOLDOWN_MINUTES_DEFAULT,
     },
     SettingDefinition {
         key: ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_KEY,
         description: "Once the cooldown above has passed, how long the admin has to actually complete the regenerate before the request expires and they have to start over.",
+        kind: SettingKind::Minutes,
         default: ADMIN_REGEN_COMPLETION_WINDOW_MINUTES_DEFAULT,
+    },
+    SettingDefinition {
+        key: QUARANTINE_ON_MANUAL_GRANT_KEY,
+        description: "When a registered permission role is granted manually (outside the bot), also strip the granter's own active sessions. Set to false to only revert the grant, without quarantining the granter.",
+        kind: SettingKind::Bool,
+        default: QUARANTINE_ON_MANUAL_GRANT_DEFAULT as i64,
     },
 ];
 
-/// All settings currently take a positive integer number of minutes, capped
-/// well under i32::MAX so values can never overflow/wrap when narrowed to
-/// i32 for interval arithmetic (Postgres `make_interval` and similar) — no
-/// per-key match needed unless a future setting has different rules.
 pub fn validate_setting(key: &str, value: &str) -> Result<(), String> {
-    if !SETTINGS_REGISTRY.iter().any(|s| s.key == key) {
-        return Err(format!("unknown setting: {key}"));
+    let def = SETTINGS_REGISTRY
+        .iter()
+        .find(|s| s.key == key)
+        .ok_or_else(|| format!("unknown setting: {key}"))?;
+
+    match def.kind {
+        SettingKind::Minutes => {
+            let n: i64 = value
+                .parse()
+                .map_err(|_| "must be a positive integer (minutes)".to_string())?;
+            if n <= 0 {
+                return Err("must be positive".to_string());
+            }
+            if n > MAX_SETTING_MINUTES {
+                return Err(format!("must be at most {MAX_SETTING_MINUTES} minutes ({} days)", MAX_SETTING_MINUTES / 1440));
+            }
+            Ok(())
+        }
+        SettingKind::Bool => {
+            if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false") {
+                Ok(())
+            } else {
+                Err("must be true or false".to_string())
+            }
+        }
     }
-    let n: i64 = value
-        .parse()
-        .map_err(|_| "must be a positive integer (minutes)".to_string())?;
-    if n <= 0 {
-        return Err("must be positive".to_string());
-    }
-    if n > MAX_SETTING_MINUTES {
-        return Err(format!("must be at most {MAX_SETTING_MINUTES} minutes ({} days)", MAX_SETTING_MINUTES / 1440));
-    }
-    Ok(())
 }
 
 pub async fn get_int_setting(
@@ -72,6 +99,24 @@ pub async fn get_int_setting(
     .await?;
     Ok(row
         .and_then(|r| r.value.parse::<i64>().ok())
+        .unwrap_or(default))
+}
+
+pub async fn get_bool_setting(
+    pool: &PgPool,
+    guild_id: i64,
+    key: &str,
+    default: bool,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query!(
+        "SELECT value FROM guild_settings WHERE guild_id = $1 AND key = $2",
+        guild_id,
+        key
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row
+        .map(|r| r.value.eq_ignore_ascii_case("true"))
         .unwrap_or(default))
 }
 
@@ -164,5 +209,31 @@ mod tests {
             &(MAX_SETTING_MINUTES + 1).to_string()
         )
         .is_err());
+    }
+
+    #[test]
+    fn accepts_true_for_bool_setting() {
+        assert_eq!(validate_setting(QUARANTINE_ON_MANUAL_GRANT_KEY, "true"), Ok(()));
+    }
+
+    #[test]
+    fn accepts_false_for_bool_setting() {
+        assert_eq!(validate_setting(QUARANTINE_ON_MANUAL_GRANT_KEY, "false"), Ok(()));
+    }
+
+    #[test]
+    fn accepts_mixed_case_bool_value() {
+        assert_eq!(validate_setting(QUARANTINE_ON_MANUAL_GRANT_KEY, "True"), Ok(()));
+    }
+
+    #[test]
+    fn rejects_non_bool_value_for_bool_setting() {
+        assert!(validate_setting(QUARANTINE_ON_MANUAL_GRANT_KEY, "1440").is_err());
+    }
+
+    #[test]
+    fn registry_contains_quarantine_key() {
+        let keys: Vec<&str> = SETTINGS_REGISTRY.iter().map(|s| s.key).collect();
+        assert!(keys.contains(&QUARANTINE_ON_MANUAL_GRANT_KEY));
     }
 }
