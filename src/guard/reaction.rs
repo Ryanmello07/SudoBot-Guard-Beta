@@ -109,7 +109,9 @@ pub async fn quarantine_actor(
     for session in &sessions {
         let role_id = RoleId::new(session.permission_role_id as u64);
         if let Ok(member) = guild_id.member(&ctx.http, UserId::new(actor_id_i64 as u64)).await {
-            let _ = member.remove_role(&ctx.http, role_id).await;
+            if let Err(e) = member.remove_role(&ctx.http, role_id).await {
+                tracing::error!(error = ?e, guild_id = guild_id_i64, actor_id = actor_id_i64, session_id = session.id, role_id = session.permission_role_id, "quarantine: failed to remove role from member");
+            }
         }
         if sqlx::query!(
             "UPDATE sessions SET revoked_at = now(), revoke_reason = 'quarantine' WHERE id = $1",
@@ -142,23 +144,29 @@ pub async fn recreate_role(
     }
     let new_role = guild_id.create_role(&ctx.http, builder).await?;
 
-    let _ = sqlx::query!(
+    if let Err(e) = sqlx::query!(
         "UPDATE role_pairs SET standard_role_id = $1 WHERE guild_id = $2 AND standard_role_id = $3",
         new_role.id.get() as i64,
         guild_id_i64,
         old_role_id_i64
     )
     .execute(pool)
-    .await;
-    let _ = sqlx::query!(
+    .await
+    {
+        tracing::error!(error = ?e, guild_id = guild_id_i64, old_role_id = old_role_id_i64, new_role_id = new_role.id.get() as i64, "guard: failed to repoint role_pairs.standard_role_id after role recreation");
+    }
+    if let Err(e) = sqlx::query!(
         "UPDATE role_pairs SET permission_role_id = $1 WHERE guild_id = $2 AND permission_role_id = $3",
         new_role.id.get() as i64,
         guild_id_i64,
         old_role_id_i64
     )
     .execute(pool)
-    .await;
-    let _ = crate::guard::baseline::upsert_baseline(
+    .await
+    {
+        tracing::error!(error = ?e, guild_id = guild_id_i64, old_role_id = old_role_id_i64, new_role_id = new_role.id.get() as i64, "guard: failed to repoint role_pairs.permission_role_id after role recreation");
+    }
+    if let Err(e) = crate::guard::baseline::upsert_baseline(
         pool,
         guild_id_i64,
         new_role.id.get() as i64,
@@ -167,7 +175,10 @@ pub async fn recreate_role(
         baseline.position,
         None,
     )
-    .await;
+    .await
+    {
+        tracing::error!(error = ?e, guild_id = guild_id_i64, old_role_id = old_role_id_i64, new_role_id = new_role.id.get() as i64, "guard: failed to upsert role_baselines after role recreation");
+    }
 
     let embed = serenity::all::CreateEmbed::new()
         .title("Registered role recreated")
