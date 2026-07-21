@@ -25,6 +25,11 @@ pub async fn handle_entry(
 }
 
 async fn handle_role_update(ctx: &Context, pool: &PgPool, guild_id_i64: i64, entry: &AuditLogEntry) {
+    let lockdown_enabled = crate::guard::is_lockdown_enabled(pool, guild_id_i64).await.unwrap_or(true);
+    if !lockdown_enabled {
+        return;
+    }
+
     let Some(target_id) = entry.target_id else { return };
     let role_id_i64 = target_id.get() as i64;
 

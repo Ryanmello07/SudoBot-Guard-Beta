@@ -14,29 +14,35 @@ pub async fn run_once(ctx: &Context, pool: &PgPool, guild_id: GuildId) {
         return;
     };
 
-    // 1. Every role's permission bitmask vs baseline; registered roles'
-    //    name/position vs baseline too.
-    for role in guild.roles.values() {
-        let role_id_i64 = role.id.get() as i64;
-        let Ok(Some(base)) = baseline::get_baseline(pool, guild_id_i64, role_id_i64).await else {
-            continue; // no baseline yet — Task 6's backfill runs at startup, this is belt-and-suspenders
-        };
-        let is_registered = baseline::is_registered_role(pool, guild_id_i64, role_id_i64)
-            .await
-            .unwrap_or(false);
+    let lockdown_enabled = crate::guard::is_lockdown_enabled(pool, guild_id_i64).await.unwrap_or(true);
 
-        let actual_bits = role.permissions.bits() as i64;
-        if permission_drifted(base.permissions, actual_bits) {
-            let _ = reaction::revert_permissions(ctx, pool, guild_id_i64, role_id_i64, base.permissions).await;
-        }
-        if let Some(baseline_name) = &base.name {
-            if name_drifted(baseline_name, &role.name, is_registered) {
-                let _ = reaction::revert_name(ctx, pool, guild_id_i64, role_id_i64, baseline_name).await;
+    // 1. Every role's permission bitmask vs baseline; registered roles'
+    //    name/position vs baseline too. Skipped entirely when lockdown is
+    //    off — only manual-grant reversion and role recreation (steps 2-3
+    //    below) stay active regardless of lockdown state.
+    if lockdown_enabled {
+        for role in guild.roles.values() {
+            let role_id_i64 = role.id.get() as i64;
+            let Ok(Some(base)) = baseline::get_baseline(pool, guild_id_i64, role_id_i64).await else {
+                continue; // no baseline yet — Task 6's backfill runs at startup, this is belt-and-suspenders
+            };
+            let is_registered = baseline::is_registered_role(pool, guild_id_i64, role_id_i64)
+                .await
+                .unwrap_or(false);
+
+            let actual_bits = role.permissions.bits() as i64;
+            if permission_drifted(base.permissions, actual_bits) {
+                let _ = reaction::revert_permissions(ctx, pool, guild_id_i64, role_id_i64, base.permissions).await;
             }
-        }
-        if let Some(baseline_position) = base.position {
-            if position_drifted(baseline_position, role.position as i32, is_registered) {
-                let _ = reaction::revert_position(ctx, pool, guild_id_i64, role_id_i64, baseline_position).await;
+            if let Some(baseline_name) = &base.name {
+                if name_drifted(baseline_name, &role.name, is_registered) {
+                    let _ = reaction::revert_name(ctx, pool, guild_id_i64, role_id_i64, baseline_name).await;
+                }
+            }
+            if let Some(baseline_position) = base.position {
+                if position_drifted(baseline_position, role.position as i32, is_registered) {
+                    let _ = reaction::revert_position(ctx, pool, guild_id_i64, role_id_i64, baseline_position).await;
+                }
             }
         }
     }
