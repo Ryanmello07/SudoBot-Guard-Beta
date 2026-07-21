@@ -100,6 +100,50 @@ impl EventHandler for Handler {
         self.setup_guild(&ctx, guild.id).await;
     }
 
+    /// Reacts to a role's live data changing — Discord's raw ROLE_UPDATE
+    /// gateway event, delivered as part of normal cache sync rather than
+    /// through the audit log. `guard::audit_handler::handle_role_update`
+    /// checks the same three things via the audit log, which was observed
+    /// live to lag noticeably for position changes specifically — up to a
+    /// minute, versus permission/name reverts landing almost immediately —
+    /// because Discord processes a role reorder more slowly than a single-
+    /// field edit. This path reacts to the state change itself, so it
+    /// isn't subject to that lag; both paths stay active for now (the
+    /// audit-log one is a harmless no-op once this one has already
+    /// reverted, since live then matches baseline).
+    ///
+    /// No explicit self-action filter is needed: when the bot's own revert
+    /// lands, this event re-fires with live state now equal to baseline, so
+    /// the drift checks below simply find nothing to do.
+    async fn guild_role_update(&self, ctx: Context, _old: Option<serenity::model::guild::Role>, new: serenity::model::guild::Role) {
+        let guild_id_i64 = new.guild_id.get() as i64;
+        let role_id_i64 = new.id.get() as i64;
+
+        let lockdown_enabled = guard::is_lockdown_enabled(&self.pool, guild_id_i64).await.unwrap_or(true);
+        if !lockdown_enabled {
+            return;
+        }
+
+        let Ok(Some(base)) = guard::baseline::get_baseline(&self.pool, guild_id_i64, role_id_i64).await else {
+            return;
+        };
+
+        let actual_bits = new.permissions.bits() as i64;
+        if guard::permission_drifted(base.permissions, actual_bits) {
+            let _ = guard::reaction::revert_permissions(&ctx, &self.pool, guild_id_i64, role_id_i64, base.permissions).await;
+        }
+        if let Some(baseline_name) = &base.name {
+            if guard::name_drifted(baseline_name, &new.name) {
+                let _ = guard::reaction::revert_name(&ctx, &self.pool, guild_id_i64, role_id_i64, baseline_name).await;
+            }
+        }
+        if let Some(baseline_position) = base.position {
+            if guard::position_drifted(baseline_position, new.position as i32) {
+                let _ = guard::reaction::revert_position(&ctx, &self.pool, guild_id_i64, role_id_i64, baseline_position).await;
+            }
+        }
+    }
+
     /// Captures a baseline for a role the instant it's created, so it's
     /// guarded from the moment it exists rather than only after the next
     /// bot restart (or the next sweep tick, which never creates baselines —
