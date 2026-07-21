@@ -1,4 +1,8 @@
-use serenity::all::{Context, GuildId, RoleId, UserId};
+use crate::logging::{log, LogTier};
+use serenity::all::{
+    ButtonStyle, ChannelId, Context, CreateActionRow, CreateButton, CreateEmbed, CreateMessage,
+    EditMessage, GuildId, RoleId, UserId,
+};
 use sqlx::PgPool;
 
 /// True if the member (given their current role IDs) holds either half of
@@ -152,6 +156,170 @@ pub async fn trigger(ctx: &Context, pool: &PgPool, guild_id: GuildId, triggered_
     }
 
     revoked_count
+}
+
+pub async fn cast_vote(pool: &PgPool, guild_id_i64: i64, voter_id_i64: i64) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "INSERT INTO panic_votes (guild_id, voter_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        guild_id_i64,
+        voter_id_i64
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn cancel_vote(pool: &PgPool, guild_id_i64: i64, voter_id_i64: i64) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "DELETE FROM panic_votes WHERE guild_id = $1 AND voter_id = $2",
+        guild_id_i64,
+        voter_id_i64
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// (yes_votes, total_eligible) computed live: total_eligible is every
+/// currently-cached member holding any `voter_roles` role; yes_votes is how
+/// many of THOSE members have also cast a vote. A stored vote from someone
+/// who no longer holds a voter role doesn't count — eligibility is always
+/// "currently," never "at the time they voted."
+pub async fn tally(ctx: &Context, pool: &PgPool, guild_id: GuildId) -> Result<(i64, i64), sqlx::Error> {
+    let guild_id_i64 = guild_id.get() as i64;
+    let voter_roles = voter_role_ids(pool, guild_id_i64).await?;
+    let Some(guild) = ctx.cache.guild(guild_id).map(|g| g.clone()) else {
+        return Ok((0, 0));
+    };
+
+    let eligible_ids: Vec<i64> = guild
+        .members
+        .values()
+        .filter(|m| m.roles.iter().any(|r| voter_roles.contains(&(r.get() as i64))))
+        .map(|m| m.user.id.get() as i64)
+        .collect();
+
+    if eligible_ids.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let yes_votes = sqlx::query!(
+        "SELECT COUNT(*) AS count FROM panic_votes WHERE guild_id = $1 AND voter_id = ANY($2)",
+        guild_id_i64,
+        &eligible_ids
+    )
+    .fetch_one(pool)
+    .await?
+    .count
+    .unwrap_or(0);
+
+    Ok((yes_votes, eligible_ids.len() as i64))
+}
+
+/// Ends the current panic episode: clears `active`, starts the 1-hour
+/// cooldown, and wipes any votes so they never carry into a future episode.
+pub async fn end_panic(pool: &PgPool, guild_id_i64: i64) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "UPDATE panic_state SET active = false, cooldown_until = now() + interval '1 hour' WHERE guild_id = $1",
+        guild_id_i64
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query!("DELETE FROM panic_votes WHERE guild_id = $1", guild_id_i64)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn record_vote_message(pool: &PgPool, guild_id_i64: i64, channel_id_i64: i64, message_id_i64: i64) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "UPDATE panic_state SET vote_channel_id = $2, vote_message_id = $3 WHERE guild_id = $1",
+        guild_id_i64,
+        channel_id_i64,
+        message_id_i64
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn vote_embed(yes_votes: i64, total_eligible: i64, resolved: bool) -> CreateEmbed {
+    let title = if resolved { "Panic Mode — Resolved" } else { "Panic Mode — Vote to Calm" };
+    let color = if resolved { 0x57F287 } else { 0xED4245 };
+    CreateEmbed::new()
+        .title(title)
+        .field(
+            "Tally",
+            format!("{yes_votes} of {total_eligible} eligible voter(s) have voted to end panic — a majority is required."),
+            false,
+        )
+        .field(
+            "How to vote",
+            "Click **Vote** or **Cancel Vote** below (a 2FA code is required), or run `/calm vote <authcode>` / `/calm cancel <authcode>` directly.",
+            false,
+        )
+        .color(color)
+}
+
+fn vote_buttons() -> CreateActionRow {
+    CreateActionRow::Buttons(vec![
+        CreateButton::new("panic_vote_button").label("Vote").style(ButtonStyle::Danger),
+        CreateButton::new("panic_cancel_button").label("Cancel Vote").style(ButtonStyle::Secondary),
+    ])
+}
+
+/// Posts the initial vote message for a freshly-triggered panic episode
+/// into the guild's configured panic channel, recording its location so
+/// later votes/cancellations know which message to edit.
+pub async fn post_vote_message(ctx: &Context, pool: &PgPool, guild_id_i64: i64) -> Result<(), serenity::Error> {
+    let Ok(Some(channel_id_i64)) = panic_channel(pool, guild_id_i64).await else {
+        tracing::error!(guild_id = guild_id_i64, "panic: no panic channel configured, vote message not posted");
+        return Ok(());
+    };
+    let channel_id = ChannelId::new(channel_id_i64 as u64);
+
+    let (yes, total) = tally(ctx, pool, GuildId::new(guild_id_i64 as u64)).await.unwrap_or((0, 0));
+    let msg = channel_id
+        .send_message(
+            &ctx.http,
+            CreateMessage::new().embed(vote_embed(yes, total, false)).components(vec![vote_buttons()]),
+        )
+        .await?;
+
+    if let Err(e) = record_vote_message(pool, guild_id_i64, channel_id_i64, msg.id.get() as i64).await {
+        tracing::error!(error = ?e, guild_id = guild_id_i64, "panic: failed to record vote message location");
+    }
+    Ok(())
+}
+
+/// Re-fetches the current tally and edits the existing vote message in
+/// place — called after every vote/cancel so the message never falls out
+/// of sync, and once more with `resolved = true` when panic actually ends.
+pub async fn update_vote_message(ctx: &Context, pool: &PgPool, guild_id_i64: i64, resolved: bool) -> Result<(), serenity::Error> {
+    let Ok(Some((channel_id_i64, message_id_i64))) = vote_message_location(pool, guild_id_i64).await else {
+        return Ok(());
+    };
+    let channel_id = ChannelId::new(channel_id_i64 as u64);
+    let message_id = serenity::all::MessageId::new(message_id_i64 as u64);
+
+    let (yes, total) = tally(ctx, pool, GuildId::new(guild_id_i64 as u64)).await.unwrap_or((0, 0));
+    let edit = if resolved {
+        EditMessage::new().embed(vote_embed(yes, total, true)).components(vec![])
+    } else {
+        EditMessage::new().embed(vote_embed(yes, total, false)).components(vec![vote_buttons()])
+    };
+    channel_id.edit_message(&ctx.http, message_id, edit).await?;
+    Ok(())
+}
+
+/// Logs a panic-related state transition consistently — used by the
+/// command layer for trigger/vote/cancel/end events.
+pub async fn log_event(pool: &PgPool, ctx: &Context, guild_id_i64: i64, title: &str, fields: Vec<(&str, String, bool)>) {
+    let mut embed = CreateEmbed::new().title(title).color(0xED4245);
+    for (name, value, inline) in fields {
+        embed = embed.field(name, value, inline);
+    }
+    let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
 }
 
 #[cfg(test)]
