@@ -1,6 +1,5 @@
 use crate::auth;
-use crate::crypto::{encryption, totp};
-use crate::elevation::{self, CodeShape};
+use crate::elevation;
 use crate::logging::{log, role_ref, user_ref, LogTier};
 use crate::yubico::YubicoClient;
 use serenity::all::{
@@ -197,17 +196,12 @@ async fn handle_auth(
     }
 
     // --- Verify the code ---
-    let Some(shape) = elevation::detect_code_shape(&code) else {
+    if elevation::detect_code_shape(&code).is_none() {
         record_attempt(pool, guild_id_i64, user_id_i64, false).await;
         return reply_followup(ctx, cmd, "That doesn't look like a valid code.").await;
-    };
+    }
 
-    let verified = match shape {
-        CodeShape::Totp => verify_totp(pool, guild_id_i64, user_id_i64, &code, encryption_key).await,
-        CodeShape::Yubikey => verify_yubikey(pool, guild_id_i64, user_id_i64, &code, yubico).await,
-    };
-
-    let verified = match verified {
+    let verified = match elevation::verify_code(pool, guild_id_i64, user_id_i64, &code, encryption_key, yubico).await {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(error = ?e, "error while verifying auth code");
@@ -312,82 +306,6 @@ async fn handle_auth(
         content.push_str(&failed_lines.join("\n"));
     }
     reply_followup(ctx, cmd, &content).await;
-}
-
-async fn verify_totp(
-    pool: &PgPool,
-    guild_id_i64: i64,
-    user_id_i64: i64,
-    code: &str,
-    encryption_key: &[u8; 32],
-) -> Result<bool, sqlx::Error> {
-    let row = sqlx::query!(
-        "SELECT totp_secret_encrypted FROM totp_enrollments WHERE guild_id = $1 AND user_id = $2 AND verified = true",
-        guild_id_i64,
-        user_id_i64
-    )
-    .fetch_optional(pool)
-    .await?;
-    let Some(row) = row else {
-        return Ok(false);
-    };
-
-    let Ok(base32_secret) = encryption::decrypt(encryption_key, &row.totp_secret_encrypted) else {
-        return Ok(false);
-    };
-    let Ok(secret_bytes) = totp_rs::Secret::Encoded(base32_secret).to_bytes() else {
-        return Ok(false);
-    };
-
-    let now_unix = chrono::Utc::now().timestamp() as u64;
-    let account_name = user_id_i64.to_string();
-    let Some(time_step) = totp::verify_code(&secret_bytes, &account_name, code, now_unix) else {
-        return Ok(false);
-    };
-
-    // Atomic replay check: insert the (guild, user, time_step) triple; if a
-    // row already existed, ON CONFLICT DO NOTHING means 0 rows affected,
-    // which is exactly the replay signal — no separate SELECT-then-INSERT
-    // race window.
-    let insert_result = sqlx::query!(
-        "INSERT INTO totp_replay_ledger (guild_id, user_id, time_step) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-        guild_id_i64,
-        user_id_i64,
-        time_step
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(insert_result.rows_affected() > 0)
-}
-
-async fn verify_yubikey(
-    pool: &PgPool,
-    guild_id_i64: i64,
-    user_id_i64: i64,
-    code: &str,
-    yubico: &YubicoClient,
-) -> Result<bool, sqlx::Error> {
-    let row = sqlx::query!(
-        "SELECT yubikey_public_id FROM yubikey_enrollments WHERE guild_id = $1 AND user_id = $2",
-        guild_id_i64,
-        user_id_i64
-    )
-    .fetch_optional(pool)
-    .await?;
-    let Some(row) = row else {
-        return Ok(false);
-    };
-
-    // Fail closed on any Yubico API error — a network hiccup denies, it
-    // never silently succeeds.
-    match yubico.verify_otp(code).await {
-        Ok(result) => Ok(result.valid && result.public_id == row.yubikey_public_id),
-        Err(e) => {
-            tracing::error!(error = ?e, "Yubico verification request failed");
-            Ok(false)
-        }
-    }
 }
 
 async fn handle_deauth(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
