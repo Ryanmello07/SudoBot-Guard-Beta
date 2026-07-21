@@ -1,7 +1,19 @@
-use crate::logging::{log, LogTier};
+use crate::logging::{log, role_ref, LogTier};
 use crate::settings;
 use serenity::all::{Context, EditRole, GuildId, Permissions, RoleId, UserId};
 use sqlx::PgPool;
+
+/// Comma-separated human-readable names of every permission set in `bits`,
+/// via serenity's own permission-name table — so a log reader sees
+/// "Administrator, Ban Members" instead of a raw integer.
+fn permission_names(bits: i64) -> String {
+    let names = Permissions::from_bits_truncate(bits as u64).get_permission_names();
+    if names.is_empty() {
+        "*None*".to_string()
+    } else {
+        names.join(", ")
+    }
+}
 
 pub async fn revert_permissions(
     ctx: &Context,
@@ -17,8 +29,9 @@ pub async fn revert_permissions(
         .await?;
 
     let embed = serenity::all::CreateEmbed::new()
-        .title("Permission edit reverted")
-        .description(format!("<@&{role_id_i64}>'s permissions were reverted to the guarded baseline."))
+        .title("Permission Edit Reverted")
+        .field("Role", role_ref(role_id_i64), true)
+        .field("Restored Permissions", permission_names(target_bits), false)
         .color(0xED4245);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
     Ok(())

@@ -1,4 +1,4 @@
-use serenity::all::{ChannelId, CreateEmbed, CreateEmbedFooter, CreateMessage, Http};
+use serenity::all::{ChannelId, CreateEmbed, CreateEmbedFooter, CreateMessage, Http, Timestamp};
 use sqlx::PgPool;
 use thiserror::Error;
 
@@ -14,6 +14,29 @@ pub enum LogError {
 pub enum LogTier {
     Info,
     Alert,
+}
+
+/// Renders a role as a clickable mention with its raw ID beneath in a
+/// copyable code block — mirrors how the bot's own reference (SudoBot)
+/// shows entities in its logs, giving both a quick jump and a value that's
+/// easy to select and paste elsewhere (an API call, another bot's command).
+/// Use `role_ref_deleted` instead once the role no longer exists — Discord
+/// can't resolve a mention for a deleted role and renders a confusing
+/// generic fallback instead of the role's name.
+pub fn role_ref(role_id: i64) -> String {
+    format!("<@&{role_id}>\n`{role_id}`")
+}
+
+/// For a role that has already been deleted (recreation's old role, a
+/// reverted lockdown-violation creation): a working mention isn't possible,
+/// so just the ID, still copyable.
+pub fn role_ref_deleted(role_id: i64) -> String {
+    format!("`{role_id}`")
+}
+
+/// Renders a user the same way as `role_ref` — mention plus copyable ID.
+pub fn user_ref(user_id: i64) -> String {
+    format!("<@{user_id}>\n`{user_id}`")
 }
 
 pub async fn log(
@@ -38,7 +61,9 @@ pub async fn log(
     };
 
     let seq = next_log_sequence(pool, guild_id).await?;
-    let embed = embed.footer(CreateEmbedFooter::new(format!("#{seq}")));
+    let embed = embed
+        .footer(CreateEmbedFooter::new(format!("#{seq}")))
+        .timestamp(Timestamp::now());
 
     let channel_id = ChannelId::new(row.channel_id as u64);
     channel_id
