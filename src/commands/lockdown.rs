@@ -89,11 +89,16 @@ async fn handle_on(
         return;
     }
 
+    // Snapshot baselines *before* flipping the flag on: if the flag flipped
+    // first, a sweep or reactive event could land in the gap between "guard
+    // is enforcing" and "baselines reflect the current state," reverting a
+    // role to its stale old baseline instead of accepting what's live now.
+    guard::backfill::sync_role_baselines(ctx, pool, guild_id, true, Some(user_id_i64)).await;
+
     if let Err(e) = settings::set_setting(pool, guild_id_i64, guard::LOCKDOWN_ENABLED_KEY, "true", user_id_i64).await {
         tracing::error!(error = ?e, "failed to enable lockdown");
         return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
     }
-    guard::backfill::sync_role_baselines(ctx, pool, guild_id, true, Some(user_id_i64)).await;
 
     reply_followup(ctx, cmd, "Lockdown enabled — full guarding is active, and every role's baseline has been refreshed to its current state.").await;
 
