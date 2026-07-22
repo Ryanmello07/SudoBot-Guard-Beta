@@ -16,7 +16,7 @@ mkdir -p "${BASE_DIR}" "${WAL_DIR}"
 
 log_info "Taking base backup ${STAMP}..."
 sudo -u "${BACKUP_SVC_USER}" env PGPASSFILE=/etc/sudobot-guard/pgpass pg_basebackup \
-    -h localhost -U "${DB_BACKUP_ROLE}" \
+    -h 127.0.0.1 -U "${DB_BACKUP_ROLE}" \
     -D "${BASE_DIR}/${STAMP}" -Fp -Xs -P
 
 # Keep only the 2 most recent base backups.

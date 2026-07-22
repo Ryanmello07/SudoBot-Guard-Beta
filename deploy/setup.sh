@@ -289,7 +289,19 @@ stage_backups() {
     fi
     mkdir -p "${BACKUP_ROOT}/base" "${BACKUP_ROOT}/wal"
     chown -R "${BACKUP_SVC_USER}:${BACKUP_SVC_USER}" "${BACKUP_ROOT}"
-    chmod 700 "${BACKUP_ROOT}"
+    chmod 750 "${BACKUP_ROOT}"
+    chmod 770 "${BACKUP_ROOT}/wal"
+    chmod 700 "${BACKUP_ROOT}/base"
+
+    # postgresql's server process (archive_command) and, later, its
+    # recovery process (restore_command) both run as the OS user
+    # `postgres`, not as ${BACKUP_SVC_USER}. Add `postgres` as a
+    # supplementary group member so it can write/read ${BACKUP_ROOT}/wal
+    # without loosening ownership or opening up ${BACKUP_ROOT}/base. This
+    # must happen before the `systemctl restart postgresql` below, since a
+    # running process only picks up new supplementary group membership on
+    # its next start.
+    usermod -aG "${BACKUP_SVC_USER}" postgres
 
     if [[ ! -f /root/.sudobot_backup_password ]]; then
         die "Expected /root/.sudobot_backup_password from stage_postgres — run that stage first."
@@ -298,7 +310,7 @@ stage_backups() {
     backup_password="$(cat /root/.sudobot_backup_password)"
     mkdir -p /etc/sudobot-guard
     umask 077
-    echo "localhost:5432:*:${DB_BACKUP_ROLE}:${backup_password}" > /etc/sudobot-guard/pgpass
+    echo "127.0.0.1:5432:*:${DB_BACKUP_ROLE}:${backup_password}" > /etc/sudobot-guard/pgpass
     chown "${BACKUP_SVC_USER}:${BACKUP_SVC_USER}" /etc/sudobot-guard/pgpass
     chmod 600 /etc/sudobot-guard/pgpass
     shred -u /root/.sudobot_backup_password
