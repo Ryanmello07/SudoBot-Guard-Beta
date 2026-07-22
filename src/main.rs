@@ -53,7 +53,6 @@ impl Handler {
         }
 
         self.backfill_role_baselines(ctx, guild_id).await;
-        guard::role_members::sync_from_rest(ctx, &self.pool, guild_id).await;
     }
 
     /// Captures a permissions baseline for any role that doesn't have one
@@ -84,7 +83,6 @@ impl EventHandler for Handler {
                     interval.tick().await;
                     for guild_id in sweep_ctx.cache.guilds() {
                         guard::sweep::run_once(&sweep_ctx, &sweep_pool, guild_id).await;
-                        guard::role_members::sync_from_rest(&sweep_ctx, &sweep_pool, guild_id).await;
                     }
                 }
             });
@@ -193,52 +191,6 @@ impl EventHandler for Handler {
         {
             tracing::error!(error = ?e, guild_id = guild_id_i64, role_id = role_id_i64, "guard: failed to capture baseline for newly created role");
         }
-    }
-
-    /// Feeds `guard::role_members`' insert-only reactive tracking: whenever a
-    /// member's data changes (including a role grant), record every role
-    /// they currently hold. Never deletes on a role having been removed —
-    /// see `role_members::record_roles`'s doc comment for why that's
-    /// deliberate (a role deletion's own member-update event would otherwise
-    /// erase the very row `reaction::recreate_role` needs to read).
-    async fn guild_member_update(
-        &self,
-        _ctx: Context,
-        _old_if_available: Option<serenity::model::guild::Member>,
-        _new: Option<serenity::model::guild::Member>,
-        event: serenity::model::event::GuildMemberUpdateEvent,
-    ) {
-        guard::role_members::record_roles(
-            &self.pool,
-            event.guild_id.get() as i64,
-            event.user.id.get() as i64,
-            &event.roles,
-        )
-        .await;
-    }
-
-    async fn guild_member_addition(&self, _ctx: Context, new_member: serenity::model::guild::Member) {
-        guard::role_members::record_roles(
-            &self.pool,
-            new_member.guild_id.get() as i64,
-            new_member.user.id.get() as i64,
-            &new_member.roles,
-        )
-        .await;
-    }
-
-    /// Clears role_members for a member who has left, been kicked, or been
-    /// banned — the one case where eager deletion is correct, since there's
-    /// no future role-recreation event that would ever need to reassign
-    /// anything to someone no longer in the guild.
-    async fn guild_member_removal(
-        &self,
-        _ctx: Context,
-        guild_id: GuildId,
-        user: serenity::model::user::User,
-        _member_data_if_available: Option<serenity::model::guild::Member>,
-    ) {
-        guard::role_members::forget_member(&self.pool, guild_id.get() as i64, user.id.get() as i64).await;
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {

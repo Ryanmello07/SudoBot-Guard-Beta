@@ -279,29 +279,6 @@ pub async fn recreate_role(
     let guild_id = GuildId::new(guild_id_i64 as u64);
     tracing::warn!(guild_id = guild_id_i64, old_role_id = old_role_id_i64, is_registered, actor_id = ?actor_id, "guard action: recreating deleted guarded role from baseline");
 
-    // Captured before any of role_pairs is repointed below — after the
-    // repoint, `permission_role_id` would already read as the NEW role id,
-    // so a check run afterward would never match `old_role_id_i64` and
-    // silently treat every permission role as a standard one.
-    let is_permission_role = sqlx::query_scalar!(
-        r#"SELECT EXISTS(SELECT 1 FROM role_pairs WHERE guild_id = $1 AND permission_role_id = $2) AS "exists!""#,
-        guild_id_i64,
-        old_role_id_i64
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap_or(false);
-
-    // Discord fires a GUILD_MEMBER_UPDATE stripping this role from every
-    // holder the instant it's deleted -- confirmed live to land tens of
-    // milliseconds before this (slower, audit-log-driven) handler runs, so
-    // both the gateway cache and a live REST member fetch already show
-    // nobody holding it by now. `role_members` is deliberately insert-only
-    // reactive (see its doc comment) precisely so this moment's read still
-    // finds the pre-deletion holders -- the strip event updates the cache,
-    // but never deletes the row here.
-    let holders = crate::guard::role_members::holders(pool, guild_id_i64, old_role_id_i64).await;
-
     let name = baseline.name.as_deref().unwrap_or("recreated-role");
     let mut builder = EditRole::new()
         .name(name)
@@ -367,40 +344,6 @@ pub async fn recreate_role(
     if let Err(e) = crate::guard::baseline::delete_baseline(pool, guild_id_i64, old_role_id_i64).await {
         tracing::error!(error = ?e, guild_id = guild_id_i64, old_role_id = old_role_id_i64, new_role_id = new_role.id.get() as i64, "guard: failed to delete old baseline after role recreation");
     }
-    // Only after `holders` above has already read them -- this is cleanup of
-    // a now-defunct role_id, not part of determining who to reassign.
-    crate::guard::role_members::forget_role(pool, guild_id_i64, old_role_id_i64).await;
-
-    // Permission roles represent an active elevated session — silently
-    // handing them back on recreation would restore elevated access without
-    // going through elevation again, defeating the point of the role pair.
-    // Standard roles and unregistered roles ("all other roles") are just
-    // identity/membership, so those get reassigned.
-    let reassign_note = if is_permission_role {
-        "Permission role — not reassigned to prior holders. Elevation must go through /auth again.".to_string()
-    } else if holders.is_empty() {
-        "No members were tracked as holding the old role (the bot's role-membership tracking may not have caught up yet if this role changed hands very recently).".to_string()
-    } else {
-        let mut reassigned = 0;
-        for user_id in &holders {
-            match guild_id.member(&ctx.http, *user_id).await {
-                Ok(member) => {
-                    if let Err(e) = member.add_role(&ctx.http, new_role.id).await {
-                        tracing::error!(error = ?e, guild_id = guild_id_i64, user_id = user_id.get(), new_role_id = new_role.id.get() as i64, "guard: failed to reassign recreated role to prior holder");
-                    } else {
-                        reassigned += 1;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = ?e, guild_id = guild_id_i64, user_id = user_id.get(), "guard: failed to fetch prior holder to reassign recreated role");
-                }
-            }
-        }
-        format!(
-            "Reassigned to {reassigned} of {} member(s) tracked as holding the old role.",
-            holders.len()
-        )
-    };
 
     let mut embed = serenity::all::CreateEmbed::new()
         .title(if is_registered { "Registered role recreated" } else { "Role recreated (lockdown)" })
@@ -408,10 +351,9 @@ pub async fn recreate_role(
         .field("New Role", role_ref(new_role.id.get() as i64), true)
         .field(
             "Note",
-            "The role was deleted and has been recreated from its guarded baseline. Re-check any external references to the old role ID.",
+            "The role was deleted and has been recreated from its guarded baseline. Members are NOT automatically reassigned to it -- re-add it manually to whoever needs it. Re-check any external references to the old role ID.",
             false,
-        )
-        .field("Member Reassignment", reassign_note, false);
+        );
     if let Some(actor_id_i64) = actor_id {
         let stripped = quarantine_actor(ctx, pool, guild_id_i64, actor_id_i64).await.unwrap_or_default();
         let quarantine_note = if stripped.is_empty() {

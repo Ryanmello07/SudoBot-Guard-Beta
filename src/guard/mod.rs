@@ -4,7 +4,6 @@ pub mod baseline;
 pub mod position_reconcile_guard;
 pub mod reaction;
 pub mod recreation_guard;
-pub mod role_members;
 pub mod sweep;
 
 pub const LOCKDOWN_ENABLED_KEY: &str = "lockdown_enabled";
