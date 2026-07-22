@@ -288,7 +288,16 @@ stage_backups() {
         useradd --system --no-create-home --shell /usr/sbin/nologin "${BACKUP_SVC_USER}"
     fi
     mkdir -p "${BACKUP_ROOT}/base" "${BACKUP_ROOT}/wal"
-    chown -R "${BACKUP_SVC_USER}:${BACKUP_SVC_USER}" "${BACKUP_ROOT}"
+    # Non-recursive: on a re-run, archive_command has already written WAL
+    # segments into wal/ owned by postgres:postgres. A recursive chown here
+    # would silently re-own them to ${BACKUP_SVC_USER}, and since postgres
+    # is only a group member (not owner) of those files, that would strip
+    # its own read access to WAL it already archived -- breaking PITR for
+    # anything archived before the re-run. Only the directories themselves
+    # need ${BACKUP_SVC_USER} ownership; file contents keep whatever user
+    # actually wrote them (pg_basebackup as ${BACKUP_SVC_USER}, or
+    # archive_command as postgres).
+    chown "${BACKUP_SVC_USER}:${BACKUP_SVC_USER}" "${BACKUP_ROOT}" "${BACKUP_ROOT}/base" "${BACKUP_ROOT}/wal"
     chmod 750 "${BACKUP_ROOT}"
     chmod 770 "${BACKUP_ROOT}/wal"
     chmod 700 "${BACKUP_ROOT}/base"
