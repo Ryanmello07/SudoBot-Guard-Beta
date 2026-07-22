@@ -318,6 +318,15 @@ stage_backups() {
     local backup_password
     backup_password="$(cat /root/.sudobot_backup_password)"
     mkdir -p /etc/sudobot-guard
+    # Ambient umask is already 077 by this point in the script (stage_postgres
+    # and stage_secrets each set it and never reset it), so mkdir -p above
+    # created this directory 0700 root:root. backup-base.sh reads pgpass as
+    # BACKUP_SVC_USER, a different user, which needs at least traversal
+    # (execute) into this directory regardless of pgpass's own permissions --
+    # without this, every nightly backup would fail to even open its own
+    # password file. 711 grants search-only access, not directory listing;
+    # the actual secrets stay protected by pgpass's own 600.
+    chmod 711 /etc/sudobot-guard
     umask 077
     echo "127.0.0.1:5432:*:${DB_BACKUP_ROLE}:${backup_password}" > /etc/sudobot-guard/pgpass
     chown "${BACKUP_SVC_USER}:${BACKUP_SVC_USER}" /etc/sudobot-guard/pgpass
@@ -393,7 +402,13 @@ EOF
     cp "${SCRIPT_DIR}/heartbeat.sh" /usr/local/bin/sudobot-guard-heartbeat.sh
     chmod 755 /usr/local/bin/sudobot-guard-disk-check.sh /usr/local/bin/sudobot-guard-heartbeat.sh
 
-    ( crontab -l 2>/dev/null | grep -v sudobot-guard-disk-check | grep -v sudobot-guard-heartbeat; \
+    # The `|| true` is load-bearing under set -euo pipefail: grep -v exits 1
+    # when it filters out every line, which happens on a fresh box (empty
+    # crontab) and on every subsequent clean re-run (nothing left after both
+    # filters) -- i.e. on every real invocation. Without it, this pipeline
+    # aborts the subshell before the two echoes run, crontab - gets no
+    # input, the monitoring jobs never install, and setup.sh dies here.
+    ( crontab -l 2>/dev/null | grep -v sudobot-guard-disk-check | grep -v sudobot-guard-heartbeat || true; \
       echo "0 6 * * * /usr/local/bin/sudobot-guard-disk-check.sh"; \
       echo "*/5 * * * * /usr/local/bin/sudobot-guard-heartbeat.sh" ) | crontab -
 
