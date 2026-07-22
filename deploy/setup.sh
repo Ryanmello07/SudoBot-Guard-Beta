@@ -216,17 +216,22 @@ stage_build() {
 }
 
 stage_secrets() {
-    if [[ -f "${ENV_FILE}" ]]; then
-        log_warn "${ENV_FILE} already exists."
-        read -rp "Overwrite it with freshly-prompted secrets? [y/N] " confirm
-        [[ "${confirm}" =~ ^[Yy]$ ]] || { log_info "Keeping existing .env."; return; }
-    fi
-
     if [[ ! -f /root/.sudobot_db_password ]]; then
         die "Expected /root/.sudobot_db_password from stage_postgres — run that stage first."
     fi
     local db_password
     db_password="$(cat /root/.sudobot_db_password)"
+
+    if [[ -f "${ENV_FILE}" ]]; then
+        log_warn "${ENV_FILE} already exists."
+        read -rp "Overwrite it with freshly-prompted secrets? [y/N] " confirm
+        if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
+            log_info "Keeping existing .env, but updating DATABASE_URL to match the just-rotated database password."
+            sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgres://${DB_APP_ROLE}:${db_password}@localhost/${DB_NAME}|" "${ENV_FILE}"
+            shred -u /root/.sudobot_db_password
+            return
+        fi
+    fi
 
     echo
     log_info "Enter the secrets this bot needs. Nothing you type here is logged."
