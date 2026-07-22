@@ -1,10 +1,13 @@
 use crate::auth;
+use crate::elevation;
 use crate::logging::{log, role_ref, user_ref, LogTier};
+use crate::yubico::YubicoClient;
 use serenity::all::{
     CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType,
     ComponentInteraction, Context, CreateActionRow, CreateCommand, CreateCommandOption,
-    CreateEmbed, CreateInteractionResponse, CreateInteractionResponseMessage, CreateSelectMenu,
-    CreateSelectMenuKind, CreateSelectMenuOption, RoleId,
+    CreateEmbed, CreateInteractionResponse, CreateInteractionResponseFollowup,
+    CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind,
+    CreateSelectMenuOption, RoleId,
 };
 use sqlx::PgPool;
 
@@ -39,6 +42,19 @@ pub fn commands() -> Vec<CreateCommand> {
                     .min_int_value(1)
                     .max_int_value(i32::MAX as u64),
                 )
+                // Must be declared before the optional `alert_tier` below:
+                // Discord requires every required option to precede all
+                // optional ones, and rejects the command registration
+                // otherwise (a runtime 400 that neither the compiler nor the
+                // tests can catch).
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "authcode",
+                        "Your TOTP or YubiKey code",
+                    )
+                    .required(true),
+                )
                 .add_sub_option(
                     CreateCommandOption::new(
                         CommandOptionType::String,
@@ -49,11 +65,21 @@ pub fn commands() -> Vec<CreateCommand> {
                     .add_string_choice("alert", "alert"),
                 ),
         )
-        .add_option(CreateCommandOption::new(
-            CommandOptionType::SubCommand,
-            "remove",
-            "Remove a registered role pair",
-        ))
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "remove",
+                "Remove a registered role pair",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "authcode",
+                    "Your TOTP or YubiKey code",
+                )
+                .required(true),
+            ),
+        )
         .add_option(CreateCommandOption::new(
             CommandOptionType::SubCommand,
             "list",
@@ -61,13 +87,19 @@ pub fn commands() -> Vec<CreateCommand> {
         ))]
 }
 
-pub async fn handle(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
+pub async fn handle(
+    ctx: &Context,
+    pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &YubicoClient,
+    cmd: &CommandInteraction,
+) {
     let Some(sub) = cmd.data.options.first() else {
         return;
     };
     match sub.name.as_str() {
-        "add" => handle_add(ctx, pool, cmd, sub).await,
-        "remove" => handle_remove(ctx, pool, cmd).await,
+        "add" => handle_add(ctx, pool, encryption_key, yubico, cmd, sub).await,
+        "remove" => handle_remove(ctx, pool, encryption_key, yubico, cmd, sub).await,
         "list" => handle_list(ctx, pool, cmd).await,
         _ => {}
     }
@@ -80,6 +112,16 @@ async fn reply_ephemeral(ctx: &Context, cmd: &CommandInteraction, content: &str)
     let _ = cmd
         .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
         .await;
+}
+
+/// Like `reply_ephemeral`, but for after the interaction has been deferred
+/// (handle_add/handle_remove defer so verifying the authcode's possible live
+/// Yubico network call stays under Discord's 3-second ack window).
+async fn reply_followup(ctx: &Context, cmd: &CommandInteraction, content: &str) {
+    let msg = CreateInteractionResponseFollowup::new()
+        .content(content)
+        .ephemeral(true);
+    let _ = cmd.create_followup(&ctx.http, msg).await;
 }
 
 /// Given the bot's own top role position and a list of (role label, position)
@@ -103,22 +145,37 @@ pub fn validate_hierarchy(
     }
 }
 
-async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub: &CommandDataOption) {
+async fn handle_add(
+    ctx: &Context,
+    pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &YubicoClient,
+    cmd: &CommandInteraction,
+    sub: &CommandDataOption,
+) {
     let Some(guild_id) = cmd.guild_id else {
         return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
     };
     let guild_id_i64 = guild_id.get() as i64;
     let user_id_i64 = cmd.user.id.get() as i64;
 
+    // Defer before verifying the authcode: verify_code can make a live Yubico
+    // network call and risk Discord's 3-second ack window. Every reply from
+    // here on must go through `reply_followup`.
+    if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = ?e, "failed to defer protect add interaction");
+        return;
+    }
+
     match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
         Ok(true) => {}
         Ok(false) => {
-            return reply_ephemeral(ctx, cmd, "You need to be a bot admin to use this command.")
+            return reply_followup(ctx, cmd, "You need to be a bot admin to use this command.")
                 .await
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to check bot admin status");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     }
 
@@ -130,23 +187,34 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
     let mut permission_role = None;
     let mut session_minutes: Option<i64> = None;
     let mut alert_tier = "info".to_string();
+    let mut authcode = None;
     for opt in opts {
         match (opt.name.as_str(), &opt.value) {
             ("standard_role", CommandDataOptionValue::Role(id)) => standard_role = Some(*id),
             ("permission_role", CommandDataOptionValue::Role(id)) => permission_role = Some(*id),
             ("session_minutes", CommandDataOptionValue::Integer(n)) => session_minutes = Some(*n),
             ("alert_tier", CommandDataOptionValue::String(s)) => alert_tier = s.clone(),
+            ("authcode", CommandDataOptionValue::String(s)) => authcode = Some(s.clone()),
             _ => {}
         }
     }
-    let (Some(standard_role), Some(permission_role), Some(session_minutes)) =
-        (standard_role, permission_role, session_minutes)
+    let (Some(standard_role), Some(permission_role), Some(session_minutes), Some(authcode)) =
+        (standard_role, permission_role, session_minutes, authcode)
     else {
-        return reply_ephemeral(ctx, cmd, "Missing required options.").await;
+        return reply_followup(ctx, cmd, "Missing required options.").await;
     };
 
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &authcode, encryption_key, yubico).await {
+        Ok(true) => {}
+        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+        Err(e) => {
+            tracing::error!(error = ?e, "protect: error verifying authcode");
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
     if standard_role == permission_role {
-        return reply_ephemeral(
+        return reply_followup(
             ctx,
             cmd,
             "Standard role and permission role must be different.",
@@ -158,7 +226,7 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
     // `ctx.cache.current_user()` doesn't exist under this name/path in
     // serenity 0.12.5, investigate the real API rather than guessing.
     let Some(guild) = ctx.cache.guild(guild_id).map(|g| g.clone()) else {
-        return reply_ephemeral(
+        return reply_followup(
             ctx,
             cmd,
             "Couldn't read this server's roles right now, try again in a moment.",
@@ -166,7 +234,7 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
         .await;
     };
     let Some(bot_member) = guild.members.get(&ctx.cache.current_user().id) else {
-        return reply_ephemeral(
+        return reply_followup(
             ctx,
             cmd,
             "Couldn't verify the bot's own role position, try again in a moment.",
@@ -200,7 +268,7 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
         ),
     ];
     if let Err(violations) = validate_hierarchy(bot_top_position, &role_positions) {
-        return reply_ephemeral(
+        return reply_followup(
             ctx,
             cmd,
             &format!(
@@ -212,7 +280,7 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
     }
 
     let Ok(session_minutes_i32) = i32::try_from(session_minutes) else {
-        return reply_ephemeral(ctx, cmd, "Session length is out of range.").await;
+        return reply_followup(ctx, cmd, "Session length is out of range.").await;
     };
 
     if let Err(e) = sqlx::query!(
@@ -229,7 +297,7 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
     .await
     {
         tracing::error!(error = ?e, "failed to insert role pair");
-        return reply_ephemeral(
+        return reply_followup(
             ctx,
             cmd,
             "Couldn't register that pair — it may already be registered, or something went wrong.",
@@ -292,7 +360,7 @@ async fn handle_add(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, sub:
         }
     }
 
-    reply_ephemeral(ctx, cmd, "Role pair registered.").await;
+    reply_followup(ctx, cmd, "Role pair registered.").await;
 
     let embed = CreateEmbed::new()
         .title("Role Pair Registered")
@@ -308,22 +376,67 @@ pub fn format_pair_label(standard_role_name: &str, permission_role_name: &str) -
     format!("{standard_role_name} \u{2192} {permission_role_name}")
 }
 
-async fn handle_remove(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
+fn extract_authcode(sub: &CommandDataOption) -> Option<String> {
+    let CommandDataOptionValue::SubCommand(opts) = &sub.value else {
+        return None;
+    };
+    opts.iter().find_map(|o| {
+        if o.name == "authcode" {
+            if let CommandDataOptionValue::String(s) = &o.value {
+                return Some(s.clone());
+            }
+        }
+        None
+    })
+}
+
+async fn handle_remove(
+    ctx: &Context,
+    pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &YubicoClient,
+    cmd: &CommandInteraction,
+    sub: &CommandDataOption,
+) {
     let Some(guild_id) = cmd.guild_id else {
         return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
     };
     let guild_id_i64 = guild_id.get() as i64;
     let user_id_i64 = cmd.user.id.get() as i64;
 
+    // Defer before verifying the authcode: verify_code can make a live Yubico
+    // network call and risk Discord's 3-second ack window. The 2FA code is
+    // required and verified here, on the initial slash invocation, before the
+    // ephemeral select menu is ever shown — the later component click that
+    // performs the delete is a clarification of WHICH pair, not a new privilege
+    // decision, and its handler still independently re-checks is_bot_admin.
+    // Every reply from here on must go through `reply_followup`.
+    if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = ?e, "failed to defer protect remove interaction");
+        return;
+    }
+
     match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
         Ok(true) => {}
         Ok(false) => {
-            return reply_ephemeral(ctx, cmd, "You need to be a bot admin to use this command.")
+            return reply_followup(ctx, cmd, "You need to be a bot admin to use this command.")
                 .await
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to check bot admin status");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    let Some(authcode) = extract_authcode(sub) else {
+        return reply_followup(ctx, cmd, "Missing required code.").await;
+    };
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &authcode, encryption_key, yubico).await {
+        Ok(true) => {}
+        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+        Err(e) => {
+            tracing::error!(error = ?e, "protect: error verifying authcode");
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     }
 
@@ -337,12 +450,12 @@ async fn handle_remove(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
         Ok(rows) => rows,
         Err(e) => {
             tracing::error!(error = ?e, "failed to list role pairs");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     };
 
     if rows.is_empty() {
-        return reply_ephemeral(ctx, cmd, "No role pairs are registered yet.").await;
+        return reply_followup(ctx, cmd, "No role pairs are registered yet.").await;
     }
 
     // Resolve role names from cache so labels are readable — select-menu
@@ -391,13 +504,11 @@ async fn handle_remove(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
         .placeholder("Choose a role pair to remove"),
     );
 
-    let msg = CreateInteractionResponseMessage::new()
+    let msg = CreateInteractionResponseFollowup::new()
         .content(content)
         .components(vec![select])
         .ephemeral(true);
-    let _ = cmd
-        .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
-        .await;
+    let _ = cmd.create_followup(&ctx.http, msg).await;
 }
 
 async fn handle_list(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
