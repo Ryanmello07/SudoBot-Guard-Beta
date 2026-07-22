@@ -369,6 +369,37 @@ EOF
     log_info "Backup timer installed (nightly at 03:00)."
 }
 
+stage_monitoring() {
+    log_info "Setting up monitoring (disk-space check, dead-man's-switch heartbeat)..."
+    mkdir -p /etc/sudobot-guard
+    if [[ ! -f /etc/sudobot-guard/monitoring.env ]]; then
+        cat > /etc/sudobot-guard/monitoring.env <<'EOF'
+# Optional. Set HEARTBEAT_URL to a healthchecks.io-style ping URL and/or
+# DISK_ALERT_EMAIL to an address `mail` can send to. Leave unset to skip
+# either check (both scripts no-op safely if unset).
+HEARTBEAT_URL=
+DISK_ALERT_EMAIL=
+EOF
+        # HEARTBEAT_URL is a bypass secret for the dead-man's-switch: anyone
+        # who reads it could ping it directly after killing the bot process,
+        # faking a still-alive signal and defeating the one thing this file
+        # exists to catch. Protect it explicitly rather than relying on
+        # whatever umask happens to be ambient at this point in the script.
+        chmod 600 /etc/sudobot-guard/monitoring.env
+        log_warn "Edit /etc/sudobot-guard/monitoring.env to enable heartbeat/disk-alert monitoring (both are no-ops until you do)."
+    fi
+
+    cp "${SCRIPT_DIR}/disk-check.sh" /usr/local/bin/sudobot-guard-disk-check.sh
+    cp "${SCRIPT_DIR}/heartbeat.sh" /usr/local/bin/sudobot-guard-heartbeat.sh
+    chmod 755 /usr/local/bin/sudobot-guard-disk-check.sh /usr/local/bin/sudobot-guard-heartbeat.sh
+
+    ( crontab -l 2>/dev/null | grep -v sudobot-guard-disk-check | grep -v sudobot-guard-heartbeat; \
+      echo "0 6 * * * /usr/local/bin/sudobot-guard-disk-check.sh"; \
+      echo "*/5 * * * * /usr/local/bin/sudobot-guard-heartbeat.sh" ) | crontab -
+
+    log_info "Monitoring cron jobs installed (disk check daily 06:00, heartbeat every 5 min)."
+}
+
 main() {
     stage_preflight
     stage_os_baseline
@@ -381,7 +412,18 @@ main() {
     stage_secrets
     stage_systemd
     stage_backups
-    log_info "Stages 1-11 complete. (Monitoring stage appended by a later task.)"
+    stage_monitoring
+    echo
+    log_info "=========================================================="
+    log_info "Setup complete."
+    log_info "Service status:  systemctl status ${SERVICE_NAME}"
+    log_info "Logs:            journalctl -u ${SERVICE_NAME} -f"
+    log_info "Firewall:        ufw status verbose"
+    log_info "Backups:         ${BACKUP_ROOT}/base and ${BACKUP_ROOT}/wal"
+    log_info "Monitoring:      edit /etc/sudobot-guard/monitoring.env to enable"
+    log_info "Remember: the ENCRYPTION_KEY printed above during setup is the"
+    log_info "only copy outside this box's disk. Save it now if you haven't."
+    log_info "=========================================================="
 }
 
 main "$@"
