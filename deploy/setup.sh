@@ -109,12 +109,71 @@ stage_firewall() {
     log_info "Firewall enabled: $(ufw status | head -1)"
 }
 
+stage_service_user() {
+    log_info "Creating service user '${SERVICE_USER}'..."
+    if id "${SERVICE_USER}" &>/dev/null; then
+        log_warn "User ${SERVICE_USER} already exists, skipping creation."
+    else
+        useradd --create-home --shell /usr/sbin/nologin "${SERVICE_USER}"
+    fi
+    log_info "Service user ready."
+}
+
+stage_postgres() {
+    log_info "Configuring PostgreSQL (local-only, least-privilege roles)..."
+    local pg_conf
+    pg_conf="$(find /etc/postgresql -maxdepth 2 -name postgresql.conf | head -1)"
+    if [[ -z "${pg_conf}" ]]; then
+        die "Could not locate postgresql.conf"
+    fi
+    sed -i "s/^#\?listen_addresses.*/listen_addresses = 'localhost'/" "${pg_conf}"
+    systemctl restart postgresql
+
+    local db_password backup_password
+    db_password="$(openssl rand -hex 24)"
+    backup_password="$(openssl rand -hex 24)"
+
+    sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL
+DO \$\$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${DB_APP_ROLE}') THEN
+        CREATE ROLE ${DB_APP_ROLE} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '${db_password}';
+    ELSE
+        ALTER ROLE ${DB_APP_ROLE} WITH PASSWORD '${db_password}';
+    END IF;
+END
+\$\$;
+SELECT 'CREATE DATABASE ${DB_NAME} OWNER ${DB_APP_ROLE}'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}')\gexec
+DO \$\$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${DB_BACKUP_ROLE}') THEN
+        CREATE ROLE ${DB_BACKUP_ROLE} WITH LOGIN REPLICATION PASSWORD '${backup_password}';
+    ELSE
+        ALTER ROLE ${DB_BACKUP_ROLE} WITH PASSWORD '${backup_password}';
+    END IF;
+END
+\$\$;
+SQL
+
+    # Root-only temp files; Task 5 reads the app password to assemble
+    # DATABASE_URL and Task 6 reads the backup password to write
+    # BACKUP_SVC_USER's PGPASSFILE. Each is shredded once consumed --
+    # never written into any world/group-readable location.
+    umask 077
+    echo "${db_password}" > /root/.sudobot_db_password
+    echo "${backup_password}" > /root/.sudobot_backup_password
+    log_info "PostgreSQL configured: DB '${DB_NAME}', app role '${DB_APP_ROLE}', backup role '${DB_BACKUP_ROLE}'."
+}
+
 main() {
     stage_preflight
     stage_os_baseline
     stage_ssh_hardening
     stage_firewall
-    log_info "Stages 1-4 complete. (More stages appended by later tasks.)"
+    stage_service_user
+    stage_postgres
+    log_info "Stages 1-6 complete. (More stages appended by later tasks.)"
 }
 
 main "$@"
