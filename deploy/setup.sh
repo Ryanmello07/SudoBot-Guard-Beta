@@ -58,19 +58,46 @@ stage_ssh_hardening() {
         die "No authorized_keys found at ${key_file} for user '${target_user}'. Refusing to disable password auth without a working key login already in place — you would lock yourself out."
     fi
 
-    local sshd_config="/etc/ssh/sshd_config"
-    sed -i \
-        -e 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' \
-        -e 's/^#\?PermitRootLogin.*/PermitRootLogin no/' \
-        "${sshd_config}"
-    if ! grep -q '^PasswordAuthentication no' "${sshd_config}"; then
-        echo "PasswordAuthentication no" >> "${sshd_config}"
+    # Root-only setups (connected directly as root, no SUDO_USER) must keep
+    # key-based root login alive, or the very next connection locks the
+    # operator out entirely. Only when there's a separate sudo user with
+    # their own working key is it safe to disable root login outright.
+    local permit_root_login="no"
+    if [[ -z "${SUDO_USER:-}" ]]; then
+        permit_root_login="prohibit-password"
+        log_warn "No SUDO_USER detected (connected directly as root). Setting PermitRootLogin to 'prohibit-password' instead of 'no' to avoid locking out the only admin account."
     fi
-    if ! grep -q '^PermitRootLogin no' "${sshd_config}"; then
-        echo "PermitRootLogin no" >> "${sshd_config}"
-    fi
+
+    # Write hardening as a drop-in rather than sed-editing sshd_config
+    # directly: modern Ubuntu/Debian cloud images include
+    # /etc/ssh/sshd_config.d/*.conf near the top of the main config, and
+    # sshd uses the FIRST value seen for each keyword. A cloud-init drop-in
+    # (e.g. 50-cloud-init.conf) can silently win over anything written into
+    # the main file. The "00-" prefix sorts this file first among drop-ins
+    # so its values take precedence.
+    local dropin_dir="/etc/ssh/sshd_config.d"
+    local dropin_file="${dropin_dir}/00-sudobot-hardening.conf"
+    mkdir -p "${dropin_dir}"
+    cat > "${dropin_file}" <<EOF
+# Managed by SudoBot Guard deploy/setup.sh (stage_ssh_hardening). Do not edit by hand.
+PasswordAuthentication no
+PermitRootLogin ${permit_root_login}
+EOF
+
     systemctl restart ssh
-    log_info "SSH hardened: key-only auth, root login disabled."
+
+    # Don't trust the file write alone: verify the config sshd will
+    # actually use (after resolving Include order/overrides) matches intent.
+    local effective
+    effective="$(sshd -T | grep -iE '^(passwordauthentication|permitrootlogin)')"
+    if ! grep -qi "^passwordauthentication no$" <<<"${effective}"; then
+        die "SSH hardening did not take effect: expected 'PasswordAuthentication no' in effective sshd config, but got:\n${effective}\nA competing sshd_config.d drop-in may be overriding ${dropin_file}."
+    fi
+    if ! grep -qi "^permitrootlogin ${permit_root_login}$" <<<"${effective}"; then
+        die "SSH hardening did not take effect: expected 'PermitRootLogin ${permit_root_login}' in effective sshd config, but got:\n${effective}\nA competing sshd_config.d drop-in may be overriding ${dropin_file}."
+    fi
+
+    log_info "SSH hardened: key-only auth, PermitRootLogin=${permit_root_login} (verified via sshd -T)."
 }
 
 stage_firewall() {
