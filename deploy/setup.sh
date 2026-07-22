@@ -166,6 +166,55 @@ SQL
     log_info "PostgreSQL configured: DB '${DB_NAME}', app role '${DB_APP_ROLE}', backup role '${DB_BACKUP_ROLE}'."
 }
 
+stage_swap() {
+    local total_mem_kb
+    total_mem_kb="$(grep MemTotal /proc/meminfo | awk '{print $2}')"
+    if (( total_mem_kb > 3000000 )); then
+        log_info "RAM is comfortably above 2GB, skipping swap setup."
+        return
+    fi
+    if swapon --show | grep -q .; then
+        log_warn "Swap already configured, skipping."
+        return
+    fi
+    log_info "Low RAM detected (${total_mem_kb}KB) — cargo build --release needs headroom. Adding a 2GB swap file..."
+    fallocate -l 2G /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    if ! grep -q '/swapfile' /etc/fstab; then
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+    log_info "Swap enabled."
+}
+
+stage_build() {
+    log_info "Installing Rust toolchain for ${SERVICE_USER}..."
+    sudo -u "${SERVICE_USER}" bash -c '
+        set -euo pipefail
+        if [[ ! -x "$HOME/.cargo/bin/cargo" ]]; then
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+        fi
+    '
+
+    log_info "Cloning/updating the repository..."
+    if [[ -d "${APP_DIR}/.git" ]]; then
+        sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" pull
+    else
+        sudo -u "${SERVICE_USER}" git clone "${REPO_URL}" "${APP_DIR}"
+    fi
+
+    log_info "Building release binary (this can take a while on 1 vCPU)..."
+    sudo -u "${SERVICE_USER}" bash -c "
+        source \"\$HOME/.cargo/env\"
+        cd '${APP_DIR}' && cargo build --release
+    "
+    if [[ ! -x "${RELEASE_BIN}" ]]; then
+        die "Build did not produce ${RELEASE_BIN}"
+    fi
+    log_info "Build complete: ${RELEASE_BIN}"
+}
+
 main() {
     stage_preflight
     stage_os_baseline
@@ -173,7 +222,9 @@ main() {
     stage_firewall
     stage_service_user
     stage_postgres
-    log_info "Stages 1-6 complete. (More stages appended by later tasks.)"
+    stage_swap
+    stage_build
+    log_info "Stages 1-8 complete. (More stages appended by later tasks.)"
 }
 
 main "$@"
