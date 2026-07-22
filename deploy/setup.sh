@@ -281,6 +281,73 @@ stage_systemd() {
     log_info "Service installed and started."
 }
 
+stage_backups() {
+    log_info "Setting up backups (WAL archiving + daily base backup)..."
+
+    if ! id "${BACKUP_SVC_USER}" &>/dev/null; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin "${BACKUP_SVC_USER}"
+    fi
+    mkdir -p "${BACKUP_ROOT}/base" "${BACKUP_ROOT}/wal"
+    chown -R "${BACKUP_SVC_USER}:${BACKUP_SVC_USER}" "${BACKUP_ROOT}"
+    chmod 700 "${BACKUP_ROOT}"
+
+    if [[ ! -f /root/.sudobot_backup_password ]]; then
+        die "Expected /root/.sudobot_backup_password from stage_postgres — run that stage first."
+    fi
+    local backup_password
+    backup_password="$(cat /root/.sudobot_backup_password)"
+    mkdir -p /etc/sudobot-guard
+    umask 077
+    echo "localhost:5432:*:${DB_BACKUP_ROLE}:${backup_password}" > /etc/sudobot-guard/pgpass
+    chown "${BACKUP_SVC_USER}:${BACKUP_SVC_USER}" /etc/sudobot-guard/pgpass
+    chmod 600 /etc/sudobot-guard/pgpass
+    shred -u /root/.sudobot_backup_password
+
+    local pg_conf pg_hba
+    pg_conf="$(find /etc/postgresql -maxdepth 2 -name postgresql.conf | head -1)"
+    pg_hba="$(find /etc/postgresql -maxdepth 2 -name pg_hba.conf | head -1)"
+
+    sed -i \
+        -e "s|^#\?archive_mode.*|archive_mode = on|" \
+        -e "s|^#\?archive_command.*|archive_command = 'test ! -f ${BACKUP_ROOT}/wal/%f \&\& cp %p ${BACKUP_ROOT}/wal/%f'|" \
+        -e "s|^#\?wal_level.*|wal_level = replica|" \
+        "${pg_conf}"
+
+    if ! grep -q "${DB_BACKUP_ROLE}" "${pg_hba}"; then
+        echo "host    replication     ${DB_BACKUP_ROLE}    127.0.0.1/32    md5" >> "${pg_hba}"
+    fi
+    systemctl restart postgresql
+
+    cp "${SCRIPT_DIR}/backup-base.sh" "/usr/local/bin/sudobot-guard-backup-base.sh"
+    chmod 755 "/usr/local/bin/sudobot-guard-backup-base.sh"
+    cp "${SCRIPT_DIR}/common.sh" "/usr/local/bin/common.sh"
+
+    cat > /etc/systemd/system/sudobot-guard-backup.service <<'EOF'
+[Unit]
+Description=SudoBot Guard nightly Postgres base backup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sudobot-guard-backup-base.sh
+EOF
+
+    cat > /etc/systemd/system/sudobot-guard-backup.timer <<'EOF'
+[Unit]
+Description=Run SudoBot Guard base backup nightly
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now sudobot-guard-backup.timer
+    log_info "Backup timer installed (nightly at 03:00)."
+}
+
 main() {
     stage_preflight
     stage_os_baseline
@@ -292,7 +359,8 @@ main() {
     stage_build
     stage_secrets
     stage_systemd
-    log_info "Stages 1-10 complete. (Backup/monitoring stages appended by later tasks.)"
+    stage_backups
+    log_info "Stages 1-11 complete. (Monitoring stage appended by a later task.)"
 }
 
 main "$@"
