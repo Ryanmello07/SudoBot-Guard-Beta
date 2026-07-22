@@ -1,9 +1,11 @@
 use crate::auth;
+use crate::elevation;
 use crate::logging::{log, user_ref, LogTier};
+use crate::yubico::YubicoClient;
 use serenity::all::{
     CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType, Context,
     CreateCommand, CreateCommandOption, CreateEmbed, CreateInteractionResponse,
-    CreateInteractionResponseMessage,
+    CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
 };
 use sqlx::PgPool;
 
@@ -28,6 +30,14 @@ pub fn commands() -> Vec<CreateCommand> {
                     "The channel to post logs in",
                 )
                 .required(true),
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "authcode",
+                    "Your TOTP or YubiKey code",
+                )
+                .required(true),
             ),
         )
         .add_option(
@@ -43,18 +53,32 @@ pub fn commands() -> Vec<CreateCommand> {
                     "The channel to post panic votes in",
                 )
                 .required(true),
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "authcode",
+                    "Your TOTP or YubiKey code",
+                )
+                .required(true),
             ),
         )]
 }
 
-pub async fn handle(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
+pub async fn handle(
+    ctx: &Context,
+    pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &YubicoClient,
+    cmd: &CommandInteraction,
+) {
     let Some(sub) = cmd.data.options.first() else {
         return;
     };
     match sub.name.as_str() {
         "claim" => handle_claim(ctx, pool, cmd).await,
-        "channel" => handle_channel(ctx, pool, cmd, sub).await,
-        "panic-channel" => handle_panic_channel(ctx, pool, cmd, sub).await,
+        "channel" => handle_channel(ctx, pool, encryption_key, yubico, cmd, sub).await,
+        "panic-channel" => handle_panic_channel(ctx, pool, encryption_key, yubico, cmd, sub).await,
         _ => {}
     }
 }
@@ -66,6 +90,55 @@ async fn reply_ephemeral(ctx: &Context, cmd: &CommandInteraction, content: &str)
     let _ = cmd
         .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
         .await;
+}
+
+/// Like `reply_ephemeral`, but for after the interaction has been deferred
+/// (handle_channel/handle_panic_channel defer so verifying the authcode's
+/// possible live Yubico network call stays under Discord's 3-second ack window).
+async fn reply_followup(ctx: &Context, cmd: &CommandInteraction, content: &str) {
+    let msg = CreateInteractionResponseFollowup::new()
+        .content(content)
+        .ephemeral(true);
+    let _ = cmd.create_followup(&ctx.http, msg).await;
+}
+
+/// Verifies the required `authcode` sub-option for the 2FA-gated setup
+/// subcommands. Returns true only when the code verifies; on a bad code or an
+/// error it has already sent the appropriate followup reply and returns false.
+async fn verify_setup_authcode(
+    ctx: &Context,
+    pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &YubicoClient,
+    cmd: &CommandInteraction,
+    opts: &[CommandDataOption],
+    guild_id_i64: i64,
+    user_id_i64: i64,
+) -> bool {
+    let authcode = opts.iter().find_map(|o| {
+        if o.name == "authcode" {
+            if let CommandDataOptionValue::String(s) = &o.value {
+                return Some(s.clone());
+            }
+        }
+        None
+    });
+    let Some(authcode) = authcode else {
+        reply_followup(ctx, cmd, "Missing required code.").await;
+        return false;
+    };
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &authcode, encryption_key, yubico).await {
+        Ok(true) => true,
+        Ok(false) => {
+            reply_followup(ctx, cmd, "That code didn't verify.").await;
+            false
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "setup: error verifying authcode");
+            reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+            false
+        }
+    }
 }
 
 async fn handle_claim(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
@@ -122,6 +195,8 @@ async fn handle_claim(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
 async fn handle_channel(
     ctx: &Context,
     pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &YubicoClient,
     cmd: &CommandInteraction,
     sub: &CommandDataOption,
 ) {
@@ -131,21 +206,34 @@ async fn handle_channel(
     let guild_id_i64 = guild_id.get() as i64;
     let user_id_i64 = cmd.user.id.get() as i64;
 
+    // Defer before verifying the authcode: verify_code can make a live Yubico
+    // network call and risk Discord's 3-second ack window. Every reply from
+    // here on must go through `reply_followup`.
+    if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = ?e, "failed to defer setup channel interaction");
+        return;
+    }
+
     match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
         Ok(true) => {}
         Ok(false) => {
-            return reply_ephemeral(ctx, cmd, "You need to be a bot admin to use this command.")
+            return reply_followup(ctx, cmd, "You need to be a bot admin to use this command.")
                 .await
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to check bot admin status");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     }
 
     let CommandDataOptionValue::SubCommand(opts) = &sub.value else {
         return;
     };
+
+    if !verify_setup_authcode(ctx, pool, encryption_key, yubico, cmd, opts, guild_id_i64, user_id_i64).await {
+        return;
+    }
+
     let channel_id = opts.iter().find_map(|o| {
         if let CommandDataOptionValue::Channel(id) = o.value {
             Some(id)
@@ -154,7 +242,7 @@ async fn handle_channel(
         }
     });
     let Some(channel_id) = channel_id else {
-        return reply_ephemeral(ctx, cmd, "No channel provided.").await;
+        return reply_followup(ctx, cmd, "No channel provided.").await;
     };
 
     if let Err(e) = sqlx::query!(
@@ -167,10 +255,10 @@ async fn handle_channel(
     .await
     {
         tracing::error!(error = ?e, "failed to set log channel");
-        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
     }
 
-    reply_ephemeral(ctx, cmd, &format!("Log channel set to <#{channel_id}>.")).await;
+    reply_followup(ctx, cmd, &format!("Log channel set to <#{channel_id}>.")).await;
 
     let embed = CreateEmbed::new()
         .title("Log Channel Configured")
@@ -183,6 +271,8 @@ async fn handle_channel(
 async fn handle_panic_channel(
     ctx: &Context,
     pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &YubicoClient,
     cmd: &CommandInteraction,
     sub: &CommandDataOption,
 ) {
@@ -192,21 +282,34 @@ async fn handle_panic_channel(
     let guild_id_i64 = guild_id.get() as i64;
     let user_id_i64 = cmd.user.id.get() as i64;
 
+    // Defer before verifying the authcode: verify_code can make a live Yubico
+    // network call and risk Discord's 3-second ack window. Every reply from
+    // here on must go through `reply_followup`.
+    if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = ?e, "failed to defer setup panic-channel interaction");
+        return;
+    }
+
     match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
         Ok(true) => {}
         Ok(false) => {
-            return reply_ephemeral(ctx, cmd, "You need to be a bot admin to use this command.")
+            return reply_followup(ctx, cmd, "You need to be a bot admin to use this command.")
                 .await
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to check bot admin status");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     }
 
     let CommandDataOptionValue::SubCommand(opts) = &sub.value else {
         return;
     };
+
+    if !verify_setup_authcode(ctx, pool, encryption_key, yubico, cmd, opts, guild_id_i64, user_id_i64).await {
+        return;
+    }
+
     let channel_id = opts.iter().find_map(|o| {
         if let CommandDataOptionValue::Channel(id) = o.value {
             Some(id)
@@ -215,7 +318,7 @@ async fn handle_panic_channel(
         }
     });
     let Some(channel_id) = channel_id else {
-        return reply_ephemeral(ctx, cmd, "No channel provided.").await;
+        return reply_followup(ctx, cmd, "No channel provided.").await;
     };
 
     if let Err(e) = sqlx::query!(
@@ -228,10 +331,10 @@ async fn handle_panic_channel(
     .await
     {
         tracing::error!(error = ?e, "failed to set panic channel");
-        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
     }
 
-    reply_ephemeral(ctx, cmd, &format!("Panic vote channel set to <#{channel_id}>.")).await;
+    reply_followup(ctx, cmd, &format!("Panic vote channel set to <#{channel_id}>.")).await;
 
     let embed = CreateEmbed::new()
         .title("Panic Channel Configured")

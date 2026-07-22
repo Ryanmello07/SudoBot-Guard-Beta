@@ -1,32 +1,67 @@
 use crate::auth;
+use crate::elevation;
 use crate::guard;
 use crate::logging::{log, user_ref, LogTier};
 use crate::settings;
+use crate::yubico::YubicoClient;
 use serenity::all::{
-    CommandInteraction, CommandOptionType, Context, CreateCommand, CreateCommandOption, CreateEmbed,
-    CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    GuildId,
+    CommandDataOption, CommandDataOptionValue, CommandInteraction, CommandOptionType, Context,
+    CreateCommand, CreateCommandOption, CreateEmbed, CreateInteractionResponse,
+    CreateInteractionResponseFollowup, CreateInteractionResponseMessage, GuildId,
 };
 use sqlx::PgPool;
 
 pub fn commands() -> Vec<CreateCommand> {
     vec![CreateCommand::new("lockdown")
         .description("Toggle full guard enforcement")
-        .add_option(CreateCommandOption::new(
-            CommandOptionType::SubCommand,
-            "on",
-            "Re-enable full guarding and refresh every role's baseline to its current state",
-        ))
-        .add_option(CreateCommandOption::new(
-            CommandOptionType::SubCommand,
-            "off",
-            "Relax guarding — only manual permission-role grant protection stays active",
-        ))
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "on",
+                "Re-enable full guarding and refresh every role's baseline to its current state",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "authcode",
+                    "Your TOTP or YubiKey code",
+                )
+                .required(true),
+            ),
+        )
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "off",
+                "Relax guarding — only manual permission-role grant protection stays active",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "authcode",
+                    "Your TOTP or YubiKey code",
+                )
+                .required(true),
+            ),
+        )
         .add_option(CreateCommandOption::new(
             CommandOptionType::SubCommand,
             "status",
             "Show whether lockdown is currently on or off",
         ))]
+}
+
+fn extract_authcode(sub: &CommandDataOption) -> Option<String> {
+    let CommandDataOptionValue::SubCommand(opts) = &sub.value else {
+        return None;
+    };
+    opts.iter().find_map(|o| {
+        if let CommandDataOptionValue::String(s) = &o.value {
+            Some(s.clone())
+        } else {
+            None
+        }
+    })
 }
 
 async fn reply_ephemeral(ctx: &Context, cmd: &CommandInteraction, content: &str) {
@@ -45,7 +80,13 @@ async fn reply_followup(ctx: &Context, cmd: &CommandInteraction, content: &str) 
     let _ = cmd.create_followup(&ctx.http, msg).await;
 }
 
-pub async fn handle(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
+pub async fn handle(
+    ctx: &Context,
+    pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &YubicoClient,
+    cmd: &CommandInteraction,
+) {
     let Some(sub) = cmd.data.options.first() else { return };
     let Some(guild_id) = cmd.guild_id else {
         return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
@@ -63,8 +104,8 @@ pub async fn handle(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
     }
 
     match sub.name.as_str() {
-        "on" => handle_on(ctx, pool, cmd, guild_id, guild_id_i64, user_id_i64).await,
-        "off" => handle_off(ctx, pool, cmd, guild_id_i64, user_id_i64).await,
+        "on" => handle_on(ctx, pool, encryption_key, yubico, cmd, sub, guild_id, guild_id_i64, user_id_i64).await,
+        "off" => handle_off(ctx, pool, encryption_key, yubico, cmd, sub, guild_id_i64, user_id_i64).await,
         "status" => handle_status(ctx, pool, cmd, guild_id_i64).await,
         _ => {}
     }
@@ -73,13 +114,17 @@ pub async fn handle(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
 async fn handle_on(
     ctx: &Context,
     pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &YubicoClient,
     cmd: &CommandInteraction,
+    sub: &CommandDataOption,
     guild_id: GuildId,
     guild_id_i64: i64,
     user_id_i64: i64,
 ) {
     // `sync_role_baselines` does two sequential DB round-trips per role (up
-    // to 250 roles in a guild), with no concurrency — that can easily exceed
+    // to 250 roles in a guild), with no concurrency — and verifying the
+    // authcode can make a live Yubico network call. Either can easily exceed
     // Discord's 3-second interaction ack window. Defer immediately so
     // Discord shows "thinking..." instead of failing the interaction; every
     // reply from here on must go through `reply_followup` instead of
@@ -87,6 +132,18 @@ async fn handle_on(
     if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
         tracing::error!(error = ?e, "failed to defer lockdown on interaction");
         return;
+    }
+
+    let Some(authcode) = extract_authcode(sub) else {
+        return reply_followup(ctx, cmd, "Missing required code.").await;
+    };
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &authcode, encryption_key, yubico).await {
+        Ok(true) => {}
+        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+        Err(e) => {
+            tracing::error!(error = ?e, "lockdown: error verifying authcode");
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
     }
 
     // Snapshot baselines *before* flipping the flag on: if the flag flipped
@@ -114,13 +171,42 @@ async fn handle_on(
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
 }
 
-async fn handle_off(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction, guild_id_i64: i64, user_id_i64: i64) {
-    if let Err(e) = settings::set_setting(pool, guild_id_i64, guard::LOCKDOWN_ENABLED_KEY, "false", user_id_i64).await {
-        tracing::error!(error = ?e, "failed to disable lockdown");
-        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+async fn handle_off(
+    ctx: &Context,
+    pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &YubicoClient,
+    cmd: &CommandInteraction,
+    sub: &CommandDataOption,
+    guild_id_i64: i64,
+    user_id_i64: i64,
+) {
+    // Defer before verifying the authcode: verify_code can make a live Yubico
+    // network call and risk Discord's 3-second ack window. Every reply from
+    // here on must go through `reply_followup`.
+    if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = ?e, "failed to defer lockdown off interaction");
+        return;
     }
 
-    reply_ephemeral(ctx, cmd, "Lockdown disabled — only manual permission-role grant protection remains active.").await;
+    let Some(authcode) = extract_authcode(sub) else {
+        return reply_followup(ctx, cmd, "Missing required code.").await;
+    };
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &authcode, encryption_key, yubico).await {
+        Ok(true) => {}
+        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+        Err(e) => {
+            tracing::error!(error = ?e, "lockdown: error verifying authcode");
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    if let Err(e) = settings::set_setting(pool, guild_id_i64, guard::LOCKDOWN_ENABLED_KEY, "false", user_id_i64).await {
+        tracing::error!(error = ?e, "failed to disable lockdown");
+        return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+    }
+
+    reply_followup(ctx, cmd, "Lockdown disabled — only manual permission-role grant protection remains active.").await;
 
     let embed = CreateEmbed::new()
         .title("Lockdown Disabled")

@@ -1,5 +1,6 @@
 use crate::auth;
 use crate::crypto::{backup_codes, encryption, totp};
+use crate::elevation;
 use crate::enrollment::{self, EnrollmentDecision};
 use crate::settings;
 use serenity::all::{
@@ -49,17 +50,31 @@ pub fn commands() -> Vec<CreateCommand> {
                     "How long they have to complete it, e.g. '30m' or '1h' (max 24h)",
                 )
                 .required(true),
+            )
+            .add_sub_option(
+                serenity::all::CreateCommandOption::new(
+                    serenity::all::CommandOptionType::String,
+                    "authcode",
+                    "Your own TOTP or YubiKey code",
+                )
+                .required(true),
             ),
         )]
 }
 
-pub async fn handle(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
+pub async fn handle(
+    ctx: &Context,
+    pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &crate::yubico::YubicoClient,
+    cmd: &CommandInteraction,
+) {
     let Some(sub) = cmd.data.options.first() else {
         return;
     };
     match sub.name.as_str() {
         "start" => handle_start(ctx, pool, cmd).await,
-        "approve" => handle_approve(ctx, pool, cmd, sub).await,
+        "approve" => handle_approve(ctx, pool, encryption_key, yubico, cmd, sub).await,
         _ => {}
     }
 }
@@ -71,6 +86,16 @@ async fn reply_ephemeral(ctx: &Context, cmd: &CommandInteraction, content: &str)
     let _ = cmd
         .create_response(&ctx.http, CreateInteractionResponse::Message(msg))
         .await;
+}
+
+/// Like `reply_ephemeral`, but for after the interaction has been deferred
+/// (handle_approve defers so verifying the approver's authcode — a possible
+/// live Yubico network call — stays under Discord's 3-second ack window).
+async fn reply_followup(ctx: &Context, cmd: &CommandInteraction, content: &str) {
+    let msg = CreateInteractionResponseFollowup::new()
+        .content(content)
+        .ephemeral(true);
+    let _ = cmd.create_followup(&ctx.http, msg).await;
 }
 
 /// True if the user is a bot admin (always eligible, per Plan 2's carried
@@ -154,6 +179,8 @@ async fn handle_start(ctx: &Context, pool: &PgPool, cmd: &CommandInteraction) {
 async fn handle_approve(
     ctx: &Context,
     pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &crate::yubico::YubicoClient,
     cmd: &CommandInteraction,
     sub: &serenity::all::CommandDataOption,
 ) {
@@ -163,15 +190,23 @@ async fn handle_approve(
     let guild_id_i64 = guild_id.get() as i64;
     let approver_id_i64 = cmd.user.id.get() as i64;
 
+    // Defer before verifying the approver's authcode: verify_code can make a
+    // live Yubico network call and risk Discord's 3-second ack window. Every
+    // reply from here on must go through `reply_followup`.
+    if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = ?e, "failed to defer enroll approve interaction");
+        return;
+    }
+
     match auth::is_bot_admin(pool, guild_id_i64, approver_id_i64).await {
         Ok(true) => {}
         Ok(false) => {
-            return reply_ephemeral(ctx, cmd, "You need to be a bot admin to use this command.")
+            return reply_followup(ctx, cmd, "You need to be a bot admin to use this command.")
                 .await
         }
         Err(e) => {
             tracing::error!(error = ?e, "failed to check bot admin status");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     }
 
@@ -181,21 +216,36 @@ async fn handle_approve(
     let mut target_user = None;
     let mut factor = None;
     let mut window_str = None;
+    let mut authcode = None;
     for opt in opts {
         match (opt.name.as_str(), &opt.value) {
             ("user", serenity::all::CommandDataOptionValue::User(id)) => target_user = Some(*id),
             ("factor", serenity::all::CommandDataOptionValue::String(s)) => factor = Some(s.clone()),
             ("window", serenity::all::CommandDataOptionValue::String(s)) => window_str = Some(s.clone()),
+            ("authcode", serenity::all::CommandDataOptionValue::String(s)) => authcode = Some(s.clone()),
             _ => {}
         }
     }
-    let (Some(target_user), Some(factor), Some(window_str)) = (target_user, factor, window_str) else {
-        return reply_ephemeral(ctx, cmd, "Missing required options.").await;
+    let (Some(target_user), Some(factor), Some(window_str), Some(authcode)) =
+        (target_user, factor, window_str, authcode)
+    else {
+        return reply_followup(ctx, cmd, "Missing required options.").await;
     };
+
+    // Verify the approving admin's OWN 2FA code before authorizing this action
+    // over another staffer. Additive to the is_bot_admin check above.
+    match elevation::verify_code(pool, guild_id_i64, approver_id_i64, &authcode, encryption_key, yubico).await {
+        Ok(true) => {}
+        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+        Err(e) => {
+            tracing::error!(error = ?e, "enroll: error verifying approver authcode");
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
 
     let window_minutes = match crate::enrollment::parse_window_minutes(&window_str) {
         Ok(m) => m,
-        Err(msg) => return reply_ephemeral(ctx, cmd, &msg).await,
+        Err(msg) => return reply_followup(ctx, cmd, &msg).await,
     };
 
     let target_user_i64 = target_user.get() as i64;
@@ -211,7 +261,7 @@ async fn handle_approve(
     // writes so neither self-approval nor cross-admin-reset can happen.
     match auth::is_bot_admin(pool, guild_id_i64, target_user_i64).await {
         Ok(true) => {
-            return reply_ephemeral(
+            return reply_followup(
                 ctx,
                 cmd,
                 "Bot admins don't need approval — they can enroll directly via /enroll start.",
@@ -221,7 +271,7 @@ async fn handle_approve(
         Ok(false) => {}
         Err(e) => {
             tracing::error!(error = ?e, "failed to check target's bot admin status");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     }
 
@@ -229,7 +279,7 @@ async fn handle_approve(
         Ok(action) => action,
         Err(e) => {
             tracing::error!(error = ?e, "failed to determine add-vs-regenerate for enrollment approval");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     };
 
@@ -237,7 +287,7 @@ async fn handle_approve(
         Ok(tx) => tx,
         Err(e) => {
             tracing::error!(error = ?e, "failed to start transaction for enrollment approval");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     };
 
@@ -256,7 +306,7 @@ async fn handle_approve(
 
     if let Err(e) = approved_at_result {
         tracing::error!(error = ?e, "failed to record enrollment approval");
-        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
     }
 
     // Regenerate approvals delete the old factor immediately, per design.
@@ -282,16 +332,16 @@ async fn handle_approve(
         };
         if let Err(e) = delete_result {
             tracing::error!(error = ?e, "failed to delete old factor during regenerate approval");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     }
 
     if let Err(e) = tx.commit().await {
         tracing::error!(error = ?e, "failed to commit enrollment approval transaction");
-        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
     }
 
-    reply_ephemeral(
+    reply_followup(
         ctx,
         cmd,
         &format!("Approved {factor} enrollment for <@{target_user}> — they have {window_minutes} minutes to complete it via /enroll start."),

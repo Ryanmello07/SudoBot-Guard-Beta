@@ -196,13 +196,13 @@ impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
             Interaction::Command(cmd) => match cmd.data.name.as_str() {
-                "setup" => commands::setup::handle(&ctx, &self.pool, &cmd).await,
-                "protect" => commands::protect::handle(&ctx, &self.pool, &cmd).await,
-                "settings" => commands::settings::handle(&ctx, &self.pool, &cmd).await,
-                "enroll" => commands::enroll::handle(&ctx, &self.pool, &cmd).await,
-                "lockdown" => commands::lockdown::handle(&ctx, &self.pool, &cmd).await,
+                "setup" => commands::setup::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await,
+                "protect" => commands::protect::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await,
+                "settings" => commands::settings::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await,
+                "enroll" => commands::enroll::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await,
+                "lockdown" => commands::lockdown::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await,
                 "panic" => commands::panic::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await,
-                "panic-voters" => commands::panic_voters::handle(&ctx, &self.pool, &cmd).await,
+                "panic-voters" => commands::panic_voters::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await,
                 "calm" => commands::calm::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await,
                 "auth" | "deauth" | "status" => {
                     commands::auth::handle(&ctx, &self.pool, &self.encryption_key, &self.yubico, &cmd).await
@@ -224,7 +224,7 @@ impl EventHandler for Handler {
             }
             Interaction::Modal(modal) => {
                 if modal.data.custom_id.starts_with("settings_modal:") {
-                    commands::settings::handle_modal(&ctx, &self.pool, &modal).await;
+                    commands::settings::handle_modal(&ctx, &self.pool, &self.encryption_key, &self.yubico, &modal).await;
                 } else if modal.data.custom_id == "panic_vote_modal" || modal.data.custom_id == "panic_cancel_modal" {
                     commands::calm::handle_modal(&ctx, &self.pool, &self.encryption_key, &self.yubico, &modal).await;
                 } else {
