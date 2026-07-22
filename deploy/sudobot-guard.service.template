@@ -1,0 +1,23 @@
+[Unit]
+Description=SudoBot Guard Discord bot
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sudobot
+WorkingDirectory=/home/sudobot/app
+EnvironmentFile=/home/sudobot/app/.env
+ExecStart=/home/sudobot/app/target/release/sudobot_guard
+Restart=on-failure
+RestartSec=5
+OnFailure=sudobot-guard-failure-notify.service
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/home/sudobot/app
+MemoryMax=768M
+
+[Install]
+WantedBy=multi-user.target

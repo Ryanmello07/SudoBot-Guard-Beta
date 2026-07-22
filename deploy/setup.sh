@@ -215,6 +215,67 @@ stage_build() {
     log_info "Build complete: ${RELEASE_BIN}"
 }
 
+stage_secrets() {
+    if [[ -f "${ENV_FILE}" ]]; then
+        log_warn "${ENV_FILE} already exists."
+        read -rp "Overwrite it with freshly-prompted secrets? [y/N] " confirm
+        [[ "${confirm}" =~ ^[Yy]$ ]] || { log_info "Keeping existing .env."; return; }
+    fi
+
+    if [[ ! -f /root/.sudobot_db_password ]]; then
+        die "Expected /root/.sudobot_db_password from stage_postgres — run that stage first."
+    fi
+    local db_password
+    db_password="$(cat /root/.sudobot_db_password)"
+
+    echo
+    log_info "Enter the secrets this bot needs. Nothing you type here is logged."
+    read -rp "DISCORD_TOKEN: " -s discord_token; echo
+    [[ -n "${discord_token}" ]] || die "DISCORD_TOKEN cannot be empty."
+    read -rp "YUBICO_CLIENT_ID: " yubico_client_id
+    [[ -n "${yubico_client_id}" ]] || die "YUBICO_CLIENT_ID cannot be empty."
+    read -rp "YUBICO_SECRET_KEY: " -s yubico_secret_key; echo
+    [[ -n "${yubico_secret_key}" ]] || die "YUBICO_SECRET_KEY cannot be empty."
+    read -rp "INITIAL_BOT_ADMIN_ID (Discord user ID, optional, press enter to skip): " initial_admin_id
+
+    local encryption_key
+    encryption_key="$(openssl rand -hex 32)"
+
+    umask 077
+    {
+        echo "DISCORD_TOKEN=${discord_token}"
+        echo "DATABASE_URL=postgres://${DB_APP_ROLE}:${db_password}@localhost/${DB_NAME}"
+        echo "ENCRYPTION_KEY=${encryption_key}"
+        echo "YUBICO_CLIENT_ID=${yubico_client_id}"
+        echo "YUBICO_SECRET_KEY=${yubico_secret_key}"
+        [[ -n "${initial_admin_id}" ]] && echo "INITIAL_BOT_ADMIN_ID=${initial_admin_id}"
+    } > "${ENV_FILE}"
+    chown "${SERVICE_USER}:${SERVICE_USER}" "${ENV_FILE}"
+    chmod 600 "${ENV_FILE}"
+
+    shred -u /root/.sudobot_db_password
+
+    echo
+    log_warn "=========================================================="
+    log_warn "ENCRYPTION_KEY (save this somewhere OFF this box right now,"
+    log_warn "e.g. a password manager -- it is never shown again, and if"
+    log_warn "it's lost every enrolled staff member must re-enroll):"
+    echo "${encryption_key}"
+    log_warn "=========================================================="
+    echo
+}
+
+stage_systemd() {
+    log_info "Installing systemd service..."
+    cp "${SCRIPT_DIR}/sudobot-guard.service.template" "/etc/systemd/system/${SERVICE_NAME}"
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_NAME}"
+    systemctl restart "${SERVICE_NAME}"
+    sleep 3
+    systemctl status "${SERVICE_NAME}" --no-pager || true
+    log_info "Service installed and started."
+}
+
 main() {
     stage_preflight
     stage_os_baseline
@@ -224,7 +285,9 @@ main() {
     stage_postgres
     stage_swap
     stage_build
-    log_info "Stages 1-8 complete. (More stages appended by later tasks.)"
+    stage_secrets
+    stage_systemd
+    log_info "Stages 1-10 complete. (Backup/monitoring stages appended by later tasks.)"
 }
 
 main "$@"
