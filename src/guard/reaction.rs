@@ -292,28 +292,15 @@ pub async fn recreate_role(
     .await
     .unwrap_or(false);
 
-    // Discord itself strips a deleted role from every member's role list the
-    // instant it's deleted — that association is gone from Discord's own
-    // records by the time this handler runs, so a REST member fetch here
-    // would show nobody holding it (unlike `panic::tally`, there's no live
-    // API fallback for "who had this before it was deleted"). Serenity's
-    // cache is the only surviving signal: its GuildRoleDelete handling only
-    // removes the role from `guild.roles`, never from cached members' own
-    // role lists, so a member cached as having held it still shows it here.
-    // This is necessarily best-effort — offline or never-chunked members
-    // aren't in the cache and won't be reassigned; that's disclosed in the
-    // log embed below rather than silently claimed as complete.
-    let holders: Vec<UserId> = ctx
-        .cache
-        .guild(guild_id)
-        .map(|g| {
-            g.members
-                .values()
-                .filter(|m| m.roles.iter().any(|r| r.get() as i64 == old_role_id_i64))
-                .map(|m| m.user.id)
-                .collect()
-        })
-        .unwrap_or_default();
+    // Discord fires a GUILD_MEMBER_UPDATE stripping this role from every
+    // holder the instant it's deleted -- confirmed live to land tens of
+    // milliseconds before this (slower, audit-log-driven) handler runs, so
+    // both the gateway cache and a live REST member fetch already show
+    // nobody holding it by now. `role_members` is deliberately insert-only
+    // reactive (see its doc comment) precisely so this moment's read still
+    // finds the pre-deletion holders -- the strip event updates the cache,
+    // but never deletes the row here.
+    let holders = crate::guard::role_members::holders(pool, guild_id_i64, old_role_id_i64).await;
 
     let name = baseline.name.as_deref().unwrap_or("recreated-role");
     let mut builder = EditRole::new()
@@ -380,6 +367,9 @@ pub async fn recreate_role(
     if let Err(e) = crate::guard::baseline::delete_baseline(pool, guild_id_i64, old_role_id_i64).await {
         tracing::error!(error = ?e, guild_id = guild_id_i64, old_role_id = old_role_id_i64, new_role_id = new_role.id.get() as i64, "guard: failed to delete old baseline after role recreation");
     }
+    // Only after `holders` above has already read them -- this is cleanup of
+    // a now-defunct role_id, not part of determining who to reassign.
+    crate::guard::role_members::forget_role(pool, guild_id_i64, old_role_id_i64).await;
 
     // Permission roles represent an active elevated session — silently
     // handing them back on recreation would restore elevated access without
@@ -389,7 +379,7 @@ pub async fn recreate_role(
     let reassign_note = if is_permission_role {
         "Permission role — not reassigned to prior holders. Elevation must go through /auth again.".to_string()
     } else if holders.is_empty() {
-        "No cached members were found holding the old role.".to_string()
+        "No members were tracked as holding the old role (the bot's role-membership tracking may not have caught up yet if this role changed hands very recently).".to_string()
     } else {
         let mut reassigned = 0;
         for user_id in &holders {
@@ -407,7 +397,7 @@ pub async fn recreate_role(
             }
         }
         format!(
-            "Reassigned to {reassigned} of {} member(s) found holding the old role in the bot's cache (best-effort — offline or never-observed members won't show up here and may need a manual re-add).",
+            "Reassigned to {reassigned} of {} member(s) tracked as holding the old role.",
             holders.len()
         )
     };
