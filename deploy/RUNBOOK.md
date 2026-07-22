@@ -11,20 +11,22 @@
 
 ## Restoring from backup
 
-See `deploy/restore.sh`. Usage: `sudo ./restore.sh "YYYY-MM-DD HH:MM:SS"` (server local time). It stops the bot and Postgres, preserves the current data directory as a sibling directory suffixed `.pre-restore-<unix-timestamp>` before overwriting anything (the actual data directory path is resolved live via `SHOW data_directory` -- typically `/var/lib/postgresql/<version>/main` on Ubuntu, not a fixed path), restores the nearest base backup, and replays WAL to the target time. Confirm via `journalctl -u postgresql` that recovery completed and promoted before starting the bot back up. Note: this script needs Postgres running to resolve its own data directory, so it's meant to be run against a fresh cluster (e.g. right after re-provisioning with `setup.sh`) or the still-live current cluster -- not as a way to recover a cluster that won't start at all.
+See `deploy/restore.sh`. Usage: `sudo ./restore.sh "YYYY-MM-DD HH:MM:SS"` (server local time). It stops the bot and Postgres, preserves the current data directory as a sibling directory suffixed `.pre-restore-<unix-timestamp>` before overwriting anything (the actual data directory path is resolved live via `SHOW data_directory` -- typically `/var/lib/postgresql/<version>/main` on Ubuntu, not a fixed path), restores the **latest** base backup, and replays WAL to the target time. Confirm via `journalctl -u postgresql` that recovery completed and promoted before starting the bot back up. Note: this script needs Postgres running to resolve its own data directory, so it's meant to be run against a fresh cluster (e.g. right after re-provisioning with `setup.sh`) or the still-live current cluster -- not as a way to recover a cluster that won't start at all.
+
+**Important -- target time must be after the latest base backup's own timestamp.** `restore.sh` always uses the newest base backup on disk; it does not pick an older one even if your target time predates it. If you need to recover to a point *before* the most recent nightly base backup was taken, the newest base is the wrong starting point for that replay and the restore will not land where you intend. Check the base backup timestamps under `/var/backups/sudobot-guard/base/` before running a restore, and if your target predates all of them, this tool cannot do it as-is.
 
 ## Incident response (box suspected compromised)
 
 1. **Revoke the Discord token immediately** via the Developer Portal -- this kills the live gateway session regardless of what else an attacker can still do on the box.
 2. **Treat the encryption key and the database as burned.** Don't trust anything currently on the box, including backups taken after the suspected compromise window.
 3. **Rebuild the host** from a clean OS image using `deploy/setup.sh`.
-4. **Restore Postgres** from the last known-good backup (`deploy/restore.sh`, targeting a timestamp before the suspected compromise).
+4. **Restore Postgres** from the last known-good backup (`deploy/restore.sh`, targeting a timestamp before the suspected compromise). This only works if a base backup taken *before* the compromise window is still on disk -- `restore.sh` always restores from the newest base backup available, so if the most recent nightly backup was itself taken after the compromise, there is no clean point to restore to with this tool as-is.
 5. **Rotate every secret** in the table above, including the encryption key.
 6. **Accept the re-enrollment cost.** Rotating the encryption key means everyone re-enrolls TOTP -- that's the price of this scenario, not a bug in the recovery process.
 
 ## Routine operations
 
-- **Redeploy code:** `sudo ./deploy.sh` (pulls, audits dependencies, rebuilds, restarts; migrations run automatically on the bot's own startup).
+- **Redeploy code:** `sudo ./deploy.sh` (pulls, audits dependencies, rebuilds, restarts; migrations run automatically on the bot's own startup). `deploy.sh` aborts the deploy if `cargo audit` reports **any** open advisory, not just high/critical severity, and there is no bypass flag -- this is deliberate, fail-closed behavior, not a bug. If a routine redeploy suddenly blocks here, review the advisory (`cargo audit` in `/home/sudobot/app`) before deciding whether it's safe to wait, rather than trying to work around the check.
 - **Check status:** `systemctl status sudobot-guard`
 - **Tail logs:** `journalctl -u sudobot-guard -f`
-- **Enable monitoring alerts:** edit `/etc/sudobot-guard/monitoring.env` and set `HEARTBEAT_URL` (a healthchecks.io-style ping URL) and/or `DISK_ALERT_EMAIL`. Both checks silently no-op until configured.
+- **Enable monitoring alerts:** edit `/etc/sudobot-guard/monitoring.env` and set `HEARTBEAT_URL` (a healthchecks.io-style ping URL) and/or `DISK_ALERT_EMAIL`. The heartbeat check fully no-ops with `HEARTBEAT_URL` unset. The disk-space check always runs regardless of `DISK_ALERT_EMAIL` (it always logs to stdout at >=85% usage) -- only the email notification is gated, and only actually sends if the `mail` command is also installed on the box.
