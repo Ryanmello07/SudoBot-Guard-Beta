@@ -122,7 +122,13 @@ stage_service_user() {
 stage_postgres() {
     log_info "Configuring PostgreSQL (local-only, least-privilege roles)..."
     local pg_conf
-    pg_conf="$(find /etc/postgresql -maxdepth 2 -name postgresql.conf | head -1)"
+    # Actual layout is /etc/postgresql/<version>/main/postgresql.conf -- that's
+    # depth 3 relative to /etc/postgresql (version=1, main=2, the file
+    # itself=3), so maxdepth 2 never finds it. Confirmed live on Ubuntu
+    # 26.04's PostgreSQL 18 packaging; not a version-specific quirk, this
+    # would have failed on any version -- the bug just never got exercised
+    # by static review alone.
+    pg_conf="$(find /etc/postgresql -maxdepth 3 -name postgresql.conf | head -1)"
     if [[ -z "${pg_conf}" ]]; then
         die "Could not locate postgresql.conf"
     fi
@@ -334,8 +340,9 @@ stage_backups() {
     shred -u /root/.sudobot_backup_password
 
     local pg_conf pg_hba
-    pg_conf="$(find /etc/postgresql -maxdepth 2 -name postgresql.conf | head -1)"
-    pg_hba="$(find /etc/postgresql -maxdepth 2 -name pg_hba.conf | head -1)"
+    # Same maxdepth fix as stage_postgres -- see the comment there.
+    pg_conf="$(find /etc/postgresql -maxdepth 3 -name postgresql.conf | head -1)"
+    pg_hba="$(find /etc/postgresql -maxdepth 3 -name pg_hba.conf | head -1)"
 
     sed -i \
         -e "s|^#\?archive_mode.*|archive_mode = on|" \
