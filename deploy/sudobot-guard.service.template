@@ -11,11 +11,19 @@ EnvironmentFile=/home/sudobot/app/.env
 ExecStart=/home/sudobot/app/target/release/sudobot_guard
 Restart=on-failure
 RestartSec=5
-OnFailure=sudobot-guard-failure-notify.service
 
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=yes
+# ProtectHome=yes (full masking) fails to EXEC the binary at all on this
+# systemd version (259) when the service runs out of /home/<user>/... --
+# confirmed live: systemd reports "Unable to locate executable: No such
+# file or directory" / exit 203, even though the file demonstrably exists
+# with correct permissions and ReadWritePaths= names it explicitly.
+# ProtectHome=read-only avoids that failure while still blocking writes
+# anywhere under /home, /root, /run/user except the ReadWritePaths=
+# exception below -- effectively the same write-protection, the service
+# just no longer has its own home directory's existence hidden from it.
+ProtectHome=read-only
 ReadWritePaths=/home/sudobot/app
 MemoryMax=768M
 
