@@ -210,7 +210,6 @@ stage_build() {
         sudo -u "${SERVICE_USER}" git clone "${REPO_URL}" "${APP_DIR}"
     fi
 
-    log_info "Building release binary (this can take a while on 1 vCPU)..."
     # sqlx::query! macros type-check against a LIVE database at compile time
     # (this repo has no offline .sqlx cache), so DATABASE_URL must be set for
     # the build itself -- even though the persisted .env with this same value
@@ -222,9 +221,33 @@ stage_build() {
     if [[ ! -f /root/.sudobot_db_password ]]; then
         die "Expected /root/.sudobot_db_password from stage_postgres — run that stage first."
     fi
-    local db_password
+    local db_password db_url
     db_password="$(cat /root/.sudobot_db_password)"
-    sudo -u "${SERVICE_USER}" env "DATABASE_URL=postgres://${DB_APP_ROLE}:${db_password}@localhost/${DB_NAME}" bash -c "
+    db_url="postgres://${DB_APP_ROLE}:${db_password}@localhost/${DB_NAME}"
+
+    # The compile-time query checks above also need the SCHEMA to already
+    # exist, not just a reachable database -- but sqlx::migrate!() (embedded
+    # in the binary) only actually applies migrations when the compiled
+    # binary runs at startup. On a genuinely fresh, empty database that's a
+    # chicken-and-egg problem: nothing has ever run the binary yet to create
+    # the schema cargo build needs to type-check against. Apply migrations
+    # directly via sqlx-cli before building. Deliberately NOT using raw
+    # `psql -f` here -- that wouldn't populate _sqlx_migrations correctly,
+    # and the bot's own migrate! call at startup would then either try to
+    # re-apply (crashing on "already exists") or, worse, see a checksum it
+    # doesn't recognize (this exact tradeoff was already learned and
+    # documented in this project's Panic Mode Task 1).
+    log_info "Applying database migrations before build (schema must exist for sqlx's compile-time query checks)..."
+    sudo -u "${SERVICE_USER}" bash -c "
+        source \"\$HOME/.cargo/env\"
+        if ! command -v sqlx &>/dev/null; then
+            cargo install sqlx-cli --no-default-features --features postgres,rustls
+        fi
+        cd '${APP_DIR}' && DATABASE_URL='${db_url}' sqlx migrate run
+    "
+
+    log_info "Building release binary (this can take a while on 1 vCPU)..."
+    sudo -u "${SERVICE_USER}" env "DATABASE_URL=${db_url}" bash -c "
         source \"\$HOME/.cargo/env\"
         cd '${APP_DIR}' && cargo build --release
     "
