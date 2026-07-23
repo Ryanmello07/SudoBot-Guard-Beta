@@ -431,10 +431,14 @@ async fn reply_component_ephemeral(ctx: &Context, comp: &ComponentInteraction, c
 }
 
 /// Shown when a self-service regenerate is refused because the submitted
-/// backup code didn't match any unused code (wrong code, or none left). Mirrors
-/// the `NeedsApproval` tone: the old factor is left fully intact (fail closed).
+/// backup code didn't match any unused code (wrong code, or none left). The
+/// old factor is left fully intact (fail closed). Does NOT point at
+/// `/enroll approve` -- every user who can reach this message is a bot admin
+/// (decide_enrollment_action only returns SelfServiceRegenerate when
+/// is_admin), and handle_approve categorically refuses bot-admin targets, so
+/// that "recovery" path is dead for 100% of this message's actual audience.
 const REGEN_BACKUP_CODE_FAILED_MSG: &str =
-    "That backup code didn't match, or you have no unused backup codes left. Your existing factor is unchanged — ask a bot admin to run /enroll approve for you instead.";
+    "That backup code didn't match, or you have no unused backup codes left. Your existing factor is unchanged. If you still have an unused code, double-check and try again -- if you've run out, there's no self-service recovery and a server operator will need to help you directly.";
 
 /// Pulls the single text value a user typed into a one-field modal.
 fn first_modal_input(modal: &ModalInteraction) -> String {
