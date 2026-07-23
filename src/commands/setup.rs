@@ -62,6 +62,52 @@ pub fn commands() -> Vec<CreateCommand> {
                 )
                 .required(true),
             ),
+        )
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "admin-add",
+                "Add another bot admin to this guild",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::User,
+                    "user",
+                    "Who to make a bot admin",
+                )
+                .required(true),
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "authcode",
+                    "Your TOTP or YubiKey code",
+                )
+                .required(true),
+            ),
+        )
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "admin-remove",
+                "Remove a bot admin from this guild",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::User,
+                    "user",
+                    "Who to remove as a bot admin",
+                )
+                .required(true),
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "authcode",
+                    "Your TOTP or YubiKey code",
+                )
+                .required(true),
+            ),
         )]
 }
 
@@ -79,6 +125,8 @@ pub async fn handle(
         "claim" => handle_claim(ctx, pool, cmd).await,
         "channel" => handle_channel(ctx, pool, encryption_key, yubico, cmd, sub).await,
         "panic-channel" => handle_panic_channel(ctx, pool, encryption_key, yubico, cmd, sub).await,
+        "admin-add" => handle_admin_add(ctx, pool, encryption_key, yubico, cmd, sub).await,
+        "admin-remove" => handle_admin_remove(ctx, pool, encryption_key, yubico, cmd, sub).await,
         _ => {}
     }
 }
@@ -347,4 +395,253 @@ async fn handle_panic_channel(
         .field("Configured By", user_ref(cmd.user.id.get() as i64), true)
         .color(0x5865F2);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Info, embed).await;
+}
+
+/// Pulls the required `user` sub-option (a `CommandOptionType::User`) out of the
+/// subcommand options as a raw i64 user id. In serenity 0.12 a User option is a
+/// single `CommandDataOptionValue::User(UserId)` (resolved member data lives in
+/// `cmd.data.resolved`, which we don't need here — the id is enough).
+fn target_user_id(opts: &[CommandDataOption]) -> Option<i64> {
+    opts.iter().find_map(|o| {
+        if o.name == "user" {
+            if let CommandDataOptionValue::User(id) = o.value {
+                return Some(id.get() as i64);
+            }
+        }
+        None
+    })
+}
+
+/// Decision for whether an `admin-remove` should proceed, given the target's
+/// current admin status and the guild's total bot-admin count. Kept as pure
+/// logic so the last-admin safety guard can be unit-tested directly, matching
+/// this codebase's pattern of testing small logic pieces (see protect.rs).
+///
+/// The `<= 1` (rather than `== 1`) is defensive: callers only reach this after
+/// confirming the target IS an admin, so the count is necessarily `>= 1`, but
+/// treating any "one or fewer" count as last-admin can never wrongly delete the
+/// final admin.
+#[derive(Debug, PartialEq, Eq)]
+enum RemovalDecision {
+    /// Target isn't a bot admin — nothing to remove.
+    NotAnAdmin,
+    /// Target is the only remaining admin — removing them would lock the guild out.
+    LastAdmin,
+    /// Safe to remove: target is an admin and at least one other admin remains.
+    Proceed,
+}
+
+fn evaluate_removal(target_is_admin: bool, admin_count: i64) -> RemovalDecision {
+    if !target_is_admin {
+        RemovalDecision::NotAnAdmin
+    } else if admin_count <= 1 {
+        RemovalDecision::LastAdmin
+    } else {
+        RemovalDecision::Proceed
+    }
+}
+
+async fn handle_admin_add(
+    ctx: &Context,
+    pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &YubicoClient,
+    cmd: &CommandInteraction,
+    sub: &CommandDataOption,
+) {
+    let Some(guild_id) = cmd.guild_id else {
+        return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = cmd.user.id.get() as i64;
+
+    // Defer before verifying the authcode: verify_code can make a live Yubico
+    // network call and risk Discord's 3-second ack window. Every reply from
+    // here on must go through `reply_followup`.
+    if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = ?e, "failed to defer setup admin-add interaction");
+        return;
+    }
+
+    match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return reply_followup(ctx, cmd, "You need to be a bot admin to use this command.")
+                .await
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check bot admin status");
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    let CommandDataOptionValue::SubCommand(opts) = &sub.value else {
+        return;
+    };
+
+    if !verify_setup_authcode(ctx, pool, encryption_key, yubico, cmd, opts, guild_id_i64, user_id_i64).await {
+        return;
+    }
+
+    let Some(target_id) = target_user_id(opts) else {
+        return reply_followup(ctx, cmd, "No user provided.").await;
+    };
+
+    // Honest reply for the harmless no-op case: add_bot_admin uses
+    // ON CONFLICT DO NOTHING, so re-adding an existing admin would otherwise
+    // report a misleading success.
+    match auth::is_bot_admin(pool, guild_id_i64, target_id).await {
+        Ok(true) => {
+            return reply_followup(ctx, cmd, &format!("<@{target_id}> is already a bot admin.")).await;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check target bot admin status");
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    if let Err(e) = auth::add_bot_admin(pool, guild_id_i64, target_id).await {
+        tracing::error!(error = ?e, "failed to add bot admin");
+        return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+    }
+
+    reply_followup(ctx, cmd, &format!("<@{target_id}> is now a bot admin for this server.")).await;
+
+    let embed = CreateEmbed::new()
+        .title("Bot Admin Added")
+        .field("Admin Added", user_ref(target_id), true)
+        .field("Added By", user_ref(user_id_i64), true)
+        .color(0x5865F2);
+    let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
+}
+
+async fn handle_admin_remove(
+    ctx: &Context,
+    pool: &PgPool,
+    encryption_key: &[u8; 32],
+    yubico: &YubicoClient,
+    cmd: &CommandInteraction,
+    sub: &CommandDataOption,
+) {
+    let Some(guild_id) = cmd.guild_id else {
+        return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = cmd.user.id.get() as i64;
+
+    // Defer before verifying the authcode: verify_code can make a live Yubico
+    // network call and risk Discord's 3-second ack window. Every reply from
+    // here on must go through `reply_followup`.
+    if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+        tracing::error!(error = ?e, "failed to defer setup admin-remove interaction");
+        return;
+    }
+
+    match auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return reply_followup(ctx, cmd, "You need to be a bot admin to use this command.")
+                .await
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check bot admin status");
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    let CommandDataOptionValue::SubCommand(opts) = &sub.value else {
+        return;
+    };
+
+    if !verify_setup_authcode(ctx, pool, encryption_key, yubico, cmd, opts, guild_id_i64, user_id_i64).await {
+        return;
+    }
+
+    let Some(target_id) = target_user_id(opts) else {
+        return reply_followup(ctx, cmd, "No user provided.").await;
+    };
+
+    // Guard sequence (order is the safety property): first confirm the target IS
+    // an admin, then check the total count. A count of 1 here necessarily means
+    // the target is the last admin, so removing them would leave the guild with
+    // zero admins — refuse. See `evaluate_removal` for the pure decision logic.
+    let target_is_admin = match auth::is_bot_admin(pool, guild_id_i64, target_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check target bot admin status");
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    };
+    if !target_is_admin {
+        return reply_followup(ctx, cmd, "That user isn't a bot admin.").await;
+    }
+
+    let count = match auth::bot_admin_count(pool, guild_id_i64).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check bot admin count");
+            return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    };
+
+    match evaluate_removal(target_is_admin, count) {
+        RemovalDecision::NotAnAdmin => {
+            return reply_followup(ctx, cmd, "That user isn't a bot admin.").await;
+        }
+        RemovalDecision::LastAdmin => {
+            return reply_followup(
+                ctx,
+                cmd,
+                "Can't remove the last bot admin — this would lock everyone in this guild out of every admin command. Add another admin first.",
+            )
+            .await;
+        }
+        RemovalDecision::Proceed => {}
+    }
+
+    if let Err(e) = auth::remove_bot_admin(pool, guild_id_i64, target_id).await {
+        tracing::error!(error = ?e, "failed to remove bot admin");
+        return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
+    }
+
+    reply_followup(ctx, cmd, &format!("<@{target_id}> is no longer a bot admin for this server.")).await;
+
+    let embed = CreateEmbed::new()
+        .title("Bot Admin Removed")
+        .field("Admin Removed", user_ref(target_id), true)
+        .field("Removed By", user_ref(user_id_i64), true)
+        .color(0x5865F2);
+    let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removal_rejected_when_target_not_admin() {
+        assert_eq!(evaluate_removal(false, 5), RemovalDecision::NotAnAdmin);
+        // Count is irrelevant when the target isn't an admin.
+        assert_eq!(evaluate_removal(false, 1), RemovalDecision::NotAnAdmin);
+        assert_eq!(evaluate_removal(false, 0), RemovalDecision::NotAnAdmin);
+    }
+
+    #[test]
+    fn removal_rejected_when_target_is_last_admin() {
+        assert_eq!(evaluate_removal(true, 1), RemovalDecision::LastAdmin);
+    }
+
+    #[test]
+    fn removal_allowed_when_another_admin_remains() {
+        assert_eq!(evaluate_removal(true, 2), RemovalDecision::Proceed);
+        assert_eq!(evaluate_removal(true, 10), RemovalDecision::Proceed);
+    }
+
+    #[test]
+    fn last_admin_guard_is_defensive_against_impossible_low_counts() {
+        // Reaching this function with target_is_admin == true guarantees count >= 1,
+        // but a 0 must never be treated as "safe to delete the last admin".
+        assert_eq!(evaluate_removal(true, 0), RemovalDecision::LastAdmin);
+    }
 }
