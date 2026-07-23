@@ -108,6 +108,27 @@ pub fn commands() -> Vec<CreateCommand> {
                 )
                 .required(true),
             ),
+        )
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "owner-revoke",
+                // Deliberately NO authcode option: this command's whole purpose
+                // is to work when the caller (the guild owner, often a rarely
+                // used "cold" account) has no 2FA factor enrolled — same
+                // chicken-and-egg reasoning as `/setup claim` and `/enroll
+                // start`. Description kept <=100 chars so Discord doesn't reject
+                // registration with a silent runtime 400 (see protect.rs notes).
+                "Server owner only: revoke a bot admin, no 2FA needed (for owners with none enrolled)",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::User,
+                    "user",
+                    "Which bot admin to revoke",
+                )
+                .required(true),
+            ),
         )]
 }
 
@@ -127,6 +148,7 @@ pub async fn handle(
         "panic-channel" => handle_panic_channel(ctx, pool, encryption_key, yubico, cmd, sub).await,
         "admin-add" => handle_admin_add(ctx, pool, encryption_key, yubico, cmd, sub).await,
         "admin-remove" => handle_admin_remove(ctx, pool, encryption_key, yubico, cmd, sub).await,
+        "owner-revoke" => handle_owner_revoke(ctx, pool, cmd, sub).await,
         _ => {}
     }
 }
@@ -611,6 +633,94 @@ async fn handle_admin_remove(
         .title("Bot Admin Removed")
         .field("Admin Removed", user_ref(target_id), true)
         .field("Removed By", user_ref(user_id_i64), true)
+        .color(0x5865F2);
+    let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
+}
+
+/// Emergency escape hatch for the actual Discord guild owner to revoke a bot
+/// admin's access, deliberately WITHOUT any 2FA gate and WITHOUT the last-admin
+/// guard that `handle_admin_remove` enforces.
+///
+/// Both omissions are load-bearing, not oversights:
+/// - No 2FA: the owner is frequently a "cold" account that has never enrolled a
+///   TOTP/YubiKey factor with this bot, so requiring proof of a factor that
+///   can't exist would make the recovery lever permanently unusable — the exact
+///   chicken-and-egg reasoning behind `handle_claim` and `/enroll start`. The
+///   gate here is a Discord-native fact instead: is the caller the guild owner.
+/// - No last-admin guard: this command is the intended ultimate backstop for
+///   precisely the lock-out scenarios that guard exists to prevent. If revoking
+///   leaves zero bot admins, that's fine — the owner (who by definition holds
+///   Manage Server) can re-bootstrap with `/setup claim`, exactly like any
+///   zero-admin recovery works today.
+///
+/// No defer: unlike the other `/setup` subcommands there is no `verify_code`
+/// call and therefore no possible live Yubico network request, so a plain
+/// `reply_ephemeral` stays well within Discord's 3-second ack window.
+async fn handle_owner_revoke(
+    ctx: &Context,
+    pool: &PgPool,
+    cmd: &CommandInteraction,
+    sub: &CommandDataOption,
+) {
+    let Some(guild_id) = cmd.guild_id else {
+        return reply_ephemeral(ctx, cmd, "This command only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+
+    // The ONLY gate: caller must be the actual guild owner. `owner_id` is base,
+    // non-privileged GUILD_CREATE data — strictly less demanding than the
+    // `members`/`roles` that protect.rs::handle_add already reads from this same
+    // cache under these same intents (GUILDS | GUILD_MEMBERS | GUILD_MODERATION),
+    // so if that read works this one does too. `.map(|g| g.owner_id)` copies the
+    // one field out and drops the cache guard immediately. A cache miss must
+    // NEVER be treated as "yes, you're the owner" — reply honestly and stop.
+    let Some(owner_id) = ctx.cache.guild(guild_id).map(|g| g.owner_id) else {
+        return reply_ephemeral(
+            ctx,
+            cmd,
+            "Couldn't verify server ownership right now, try again in a moment.",
+        )
+        .await;
+    };
+    if cmd.user.id != owner_id {
+        return reply_ephemeral(ctx, cmd, "Only the server owner can use this command.").await;
+    }
+
+    let CommandDataOptionValue::SubCommand(opts) = &sub.value else {
+        return;
+    };
+    let Some(target_id) = target_user_id(opts) else {
+        return reply_ephemeral(ctx, cmd, "No user provided.").await;
+    };
+
+    // Honest no-op reply if the target isn't currently an admin — nothing to
+    // revoke. This is the only status check on the target: deliberately no
+    // last-admin guard (see the doc comment above).
+    match auth::is_bot_admin(pool, guild_id_i64, target_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return reply_ephemeral(ctx, cmd, "That user isn't a bot admin.").await;
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to check target bot admin status");
+            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    if let Err(e) = auth::remove_bot_admin(pool, guild_id_i64, target_id).await {
+        tracing::error!(error = ?e, "failed to remove bot admin");
+        return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
+    }
+
+    reply_ephemeral(ctx, cmd, &format!("<@{target_id}> is no longer a bot admin for this server.")).await;
+
+    // Title is deliberately distinct from admin-remove's "Bot Admin Removed" so
+    // an operator scanning the log channel can tell an owner-initiated emergency
+    // revocation apart from routine peer admin management at a glance.
+    let embed = CreateEmbed::new()
+        .title("Bot Admin Revoked by Owner")
+        .field("Admin Revoked", user_ref(target_id), true)
+        .field("Revoked By (Server Owner)", user_ref(cmd.user.id.get() as i64), true)
         .color(0x5865F2);
     let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
 }
