@@ -234,9 +234,13 @@ async fn handle_approve(
 
     // Verify the approving admin's OWN 2FA code before authorizing this action
     // over another staffer. Additive to the is_bot_admin check above.
-    match elevation::verify_code(pool, guild_id_i64, approver_id_i64, &authcode, encryption_key, yubico).await {
-        Ok(true) => {}
-        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+    match elevation::verify_code(pool, guild_id_i64, approver_id_i64, &authcode, encryption_key, yubico, elevation::LockoutPolicy::Enforce).await {
+        Ok(elevation::VerifyOutcome::Verified) => {}
+        Ok(elevation::VerifyOutcome::Invalid) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+        Ok(elevation::VerifyOutcome::LockedOut { failure_count }) => {
+            crate::logging::log_auth_lockout(pool, &ctx.http, guild_id_i64, approver_id_i64, failure_count).await;
+            return reply_followup(ctx, cmd, "Too many failed attempts. Try again later.").await;
+        }
         Err(e) => {
             tracing::error!(error = ?e, "enroll: error verifying approver authcode");
             return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;

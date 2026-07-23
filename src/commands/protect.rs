@@ -204,9 +204,13 @@ async fn handle_add(
         return reply_followup(ctx, cmd, "Missing required options.").await;
     };
 
-    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &authcode, encryption_key, yubico).await {
-        Ok(true) => {}
-        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &authcode, encryption_key, yubico, elevation::LockoutPolicy::Enforce).await {
+        Ok(elevation::VerifyOutcome::Verified) => {}
+        Ok(elevation::VerifyOutcome::Invalid) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+        Ok(elevation::VerifyOutcome::LockedOut { failure_count }) => {
+            crate::logging::log_auth_lockout(pool, &ctx.http, guild_id_i64, user_id_i64, failure_count).await;
+            return reply_followup(ctx, cmd, "Too many failed attempts. Try again later.").await;
+        }
         Err(e) => {
             tracing::error!(error = ?e, "protect: error verifying authcode");
             return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
@@ -431,9 +435,13 @@ async fn handle_remove(
     let Some(authcode) = extract_authcode(sub) else {
         return reply_followup(ctx, cmd, "Missing required code.").await;
     };
-    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &authcode, encryption_key, yubico).await {
-        Ok(true) => {}
-        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &authcode, encryption_key, yubico, elevation::LockoutPolicy::Enforce).await {
+        Ok(elevation::VerifyOutcome::Verified) => {}
+        Ok(elevation::VerifyOutcome::Invalid) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+        Ok(elevation::VerifyOutcome::LockedOut { failure_count }) => {
+            crate::logging::log_auth_lockout(pool, &ctx.http, guild_id_i64, user_id_i64, failure_count).await;
+            return reply_followup(ctx, cmd, "Too many failed attempts. Try again later.").await;
+        }
         Err(e) => {
             tracing::error!(error = ?e, "protect: error verifying authcode");
             return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
