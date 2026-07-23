@@ -32,6 +32,17 @@ pub async fn add_bot_admin(pool: &PgPool, guild_id: i64, user_id: i64) -> Result
     Ok(())
 }
 
+pub async fn remove_bot_admin(pool: &PgPool, guild_id: i64, user_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "DELETE FROM bot_admins WHERE guild_id = $1 AND user_id = $2",
+        guild_id,
+        user_id
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn bootstrap_admin_if_needed(
     pool: &PgPool,
     guild_id: i64,
