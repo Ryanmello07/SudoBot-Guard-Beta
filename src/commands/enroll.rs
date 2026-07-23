@@ -1115,7 +1115,17 @@ async fn handle_yubikey_modal(
 
     let backup_codes_shown = issue_backup_codes_if_first_factor(pool, guild_id_i64, user_id_i64).await;
 
-    let mut content = "YubiKey verified and enrolled.".to_string();
+    // Surface the registered key's public ID immediately: enrollment only
+    // checks that the pasted OTP is *valid*, not that it came from the
+    // physical key the user meant to register (there's no way to check
+    // "intent" beyond OTP validity -- a genuinely valid OTP from the wrong
+    // key passes just as cleanly). Showing the ID lets the user catch a
+    // wrong-key mistake on the spot instead of discovering it days later
+    // when their real key's OTPs all start failing.
+    let mut content = format!(
+        "YubiKey verified and enrolled (key ID: `{}`). If this doesn't match the key you meant to register, run `/enroll start` again right away to fix it.",
+        result.public_id
+    );
     if let Some(codes) = backup_codes_shown {
         content.push_str("\n\nSave these one-time backup codes now — they won't be shown again:\n");
         content.push_str(&codes.join("\n"));
