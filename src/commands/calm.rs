@@ -110,9 +110,11 @@ async fn handle_vote(
     user_id_i64: i64,
     authcode: &str,
 ) {
-    match elevation::verify_code(pool, guild_id_i64, user_id_i64, authcode, encryption_key, yubico).await {
-        Ok(true) => {}
-        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+    // Exempt: a fumbled code on some unrelated admin command must never lock an
+    // admin out of ending an active panic. Attempts are still recorded for audit.
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, authcode, encryption_key, yubico, elevation::LockoutPolicy::Exempt).await {
+        Ok(elevation::VerifyOutcome::Verified) => {}
+        Ok(_) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
         Err(e) => {
             tracing::error!(error = ?e, "calm: error verifying vote code");
             return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
@@ -163,9 +165,11 @@ async fn handle_cancel(
     user_id_i64: i64,
     authcode: &str,
 ) {
-    match elevation::verify_code(pool, guild_id_i64, user_id_i64, authcode, encryption_key, yubico).await {
-        Ok(true) => {}
-        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+    // Exempt: a fumbled code on some unrelated admin command must never lock an
+    // admin out of ending an active panic. Attempts are still recorded for audit.
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, authcode, encryption_key, yubico, elevation::LockoutPolicy::Exempt).await {
+        Ok(elevation::VerifyOutcome::Verified) => {}
+        Ok(_) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
         Err(e) => {
             tracing::error!(error = ?e, "calm: error verifying cancel code");
             return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
@@ -227,9 +231,11 @@ async fn handle_override(
             return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
     }
-    match elevation::verify_code(pool, guild_id_i64, user_id_i64, authcode, encryption_key, yubico).await {
-        Ok(true) => {}
-        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+    // Exempt: a fumbled code on some unrelated admin command must never lock an
+    // admin out of ending an active panic. Attempts are still recorded for audit.
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, authcode, encryption_key, yubico, elevation::LockoutPolicy::Exempt).await {
+        Ok(elevation::VerifyOutcome::Verified) => {}
+        Ok(_) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
         Err(e) => {
             tracing::error!(error = ?e, "calm: error verifying override code");
             return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
@@ -345,9 +351,10 @@ pub async fn handle_modal(
         })
         .unwrap_or_default();
 
-    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &code, encryption_key, yubico).await {
-        Ok(true) => {}
-        Ok(false) => return reply_modal_followup(ctx, modal, "That code didn't verify.").await,
+    // Exempt (see slash handlers above): emergency de-escalation path.
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &code, encryption_key, yubico, elevation::LockoutPolicy::Exempt).await {
+        Ok(elevation::VerifyOutcome::Verified) => {}
+        Ok(_) => return reply_modal_followup(ctx, modal, "That code didn't verify.").await,
         Err(e) => {
             tracing::error!(error = ?e, "calm: error verifying vote/cancel modal code");
             return reply_modal_followup(ctx, modal, "Something went wrong. Try again later.").await;

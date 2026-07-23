@@ -127,10 +127,15 @@ async fn verify_setup_authcode(
         reply_followup(ctx, cmd, "Missing required code.").await;
         return false;
     };
-    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &authcode, encryption_key, yubico).await {
-        Ok(true) => true,
-        Ok(false) => {
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &authcode, encryption_key, yubico, elevation::LockoutPolicy::Enforce).await {
+        Ok(elevation::VerifyOutcome::Verified) => true,
+        Ok(elevation::VerifyOutcome::Invalid) => {
             reply_followup(ctx, cmd, "That code didn't verify.").await;
+            false
+        }
+        Ok(elevation::VerifyOutcome::LockedOut { failure_count }) => {
+            crate::logging::log_auth_lockout(pool, &ctx.http, guild_id_i64, user_id_i64, failure_count).await;
+            reply_followup(ctx, cmd, "Too many failed attempts. Try again later.").await;
             false
         }
         Err(e) => {

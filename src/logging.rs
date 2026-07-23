@@ -39,6 +39,35 @@ pub fn user_ref(user_id: i64) -> String {
     format!("<@{user_id}>\n`{user_id}`")
 }
 
+/// Builds and posts the standard "Auth Lockout" alert. Shared by every command
+/// that enforces brute-force lockout (via `elevation::verify_code` with
+/// `LockoutPolicy::Enforce`) so the alert's exact shape — title, `User` field,
+/// `Failed Attempts` field, red colour, `Alert` tier — is defined once and
+/// can't drift between call sites. The user-facing reply stays per-caller,
+/// since reply mechanics differ (followup vs. modal followup vs. component
+/// update). Best-effort, matching `log`: a delivery failure is swallowed.
+pub async fn log_auth_lockout(
+    pool: &PgPool,
+    http: &Http,
+    guild_id: i64,
+    user_id: i64,
+    failure_count: i64,
+) {
+    let embed = CreateEmbed::new()
+        .title("Auth Lockout")
+        .field("User", user_ref(user_id), true)
+        .field(
+            "Failed Attempts",
+            format!(
+                "{failure_count} in the last {} minutes",
+                crate::elevation::LOCKOUT_WINDOW_MINUTES
+            ),
+            true,
+        )
+        .color(0xED4245);
+    let _ = log(pool, http, guild_id, LogTier::Alert, embed).await;
+}
+
 pub async fn log(
     pool: &PgPool,
     http: &Http,

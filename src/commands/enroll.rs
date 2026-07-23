@@ -234,9 +234,13 @@ async fn handle_approve(
 
     // Verify the approving admin's OWN 2FA code before authorizing this action
     // over another staffer. Additive to the is_bot_admin check above.
-    match elevation::verify_code(pool, guild_id_i64, approver_id_i64, &authcode, encryption_key, yubico).await {
-        Ok(true) => {}
-        Ok(false) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+    match elevation::verify_code(pool, guild_id_i64, approver_id_i64, &authcode, encryption_key, yubico, elevation::LockoutPolicy::Enforce).await {
+        Ok(elevation::VerifyOutcome::Verified) => {}
+        Ok(elevation::VerifyOutcome::Invalid) => return reply_followup(ctx, cmd, "That code didn't verify.").await,
+        Ok(elevation::VerifyOutcome::LockedOut { failure_count }) => {
+            crate::logging::log_auth_lockout(pool, &ctx.http, guild_id_i64, approver_id_i64, failure_count).await;
+            return reply_followup(ctx, cmd, "Too many failed attempts. Try again later.").await;
+        }
         Err(e) => {
             tracing::error!(error = ?e, "enroll: error verifying approver authcode");
             return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
@@ -401,6 +405,18 @@ pub async fn handle_component(
         }
         "enroll_yubikey" => handle_yubikey_button(ctx, pool, comp).await,
         "enroll_both" => handle_totp_button(ctx, pool, encryption_key, comp, true).await,
+        // Post-regenerate continuation: the backup code was already verified and
+        // consumed and the old YubiKey factor deleted, so open the enroll modal
+        // directly rather than re-running the gate (which would now see no
+        // verified factor and needlessly reprompt).
+        "yubikey_enroll_after_regen" => {
+            if let Err(e) = comp
+                .create_response(&ctx.http, serenity::all::CreateInteractionResponse::Modal(yubikey_enroll_modal()))
+                .await
+            {
+                tracing::error!(error = ?e, "failed to open YubiKey enroll modal after regen");
+            }
+        }
         _ => {}
     }
 }
@@ -412,6 +428,149 @@ async fn reply_component_ephemeral(ctx: &Context, comp: &ComponentInteraction, c
     let _ = comp
         .create_response(&ctx.http, serenity::all::CreateInteractionResponse::Message(msg))
         .await;
+}
+
+/// Shown when a self-service regenerate is refused because the submitted
+/// backup code didn't match any unused code (wrong code, or none left). The
+/// old factor is left fully intact (fail closed). Does NOT point at
+/// `/enroll approve` -- every user who can reach this message is a bot admin
+/// (decide_enrollment_action only returns SelfServiceRegenerate when
+/// is_admin), and handle_approve categorically refuses bot-admin targets, so
+/// that "recovery" path is dead for 100% of this message's actual audience.
+const REGEN_BACKUP_CODE_FAILED_MSG: &str =
+    "That backup code didn't match, or you have no unused backup codes left. Your existing factor is unchanged. If you still have an unused code, double-check and try again -- if you've run out, there's no self-service recovery and a server operator will need to help you directly.";
+
+/// Pulls the single text value a user typed into a one-field modal.
+fn first_modal_input(modal: &ModalInteraction) -> String {
+    modal
+        .data
+        .components
+        .iter()
+        .flat_map(|row| row.components.iter())
+        .find_map(|c| {
+            if let serenity::all::ActionRowComponent::InputText(input) = c {
+                input.value.clone()
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// Opens a modal prompting for a backup code. Used to gate a self-service
+/// regenerate behind proof of possession before the existing factor is touched.
+async fn open_backup_code_modal(ctx: &Context, comp: &ComponentInteraction, modal_id: &str, title: &str) {
+    let modal = CreateModal::new(modal_id, title).components(vec![CreateActionRow::InputText(
+        CreateInputText::new(InputTextStyle::Short, "Backup code", "backup_code")
+            .placeholder("10-character backup code")
+            .required(true),
+    )]);
+    if let Err(e) = comp
+        .create_response(&ctx.http, serenity::all::CreateInteractionResponse::Modal(modal))
+        .await
+    {
+        tracing::error!(error = ?e, "failed to open backup code modal");
+    }
+}
+
+/// Finds the id of the user's first unused backup-code row whose hash the
+/// submitted `code` verifies against, or `None` if none match. Does NOT consume
+/// it — consumption happens later, guarded, inside the regenerate transaction.
+async fn find_unused_matching_backup_code(
+    pool: &PgPool,
+    guild_id_i64: i64,
+    user_id_i64: i64,
+    code: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    let rows = sqlx::query!(
+        "SELECT id, code_hash FROM backup_codes WHERE guild_id = $1 AND user_id = $2 AND used_at IS NULL",
+        guild_id_i64,
+        user_id_i64
+    )
+    .fetch_all(pool)
+    .await?;
+    let hashes: Vec<String> = rows.iter().map(|r| r.code_hash.clone()).collect();
+    Ok(backup_codes::find_matching_code_index(code, &hashes).map(|i| rows[i].id))
+}
+
+/// Generates a fresh TOTP secret and returns `(encrypted_secret, base32, qr_png)`.
+/// Pure of any DB writes so callers can store it inside their own transaction.
+fn generate_totp_material(
+    encryption_key: &[u8; 32],
+    account_user_id: serenity::all::UserId,
+) -> Result<(Vec<u8>, String, Vec<u8>), ()> {
+    let secret_bytes = totp::generate_secret_bytes();
+    let account_name = account_user_id.to_string();
+    let totp_instance = totp::build_totp(secret_bytes, account_name);
+    let base32 = totp::base32_secret(&totp_instance);
+    let png = match totp::provisioning_qr_png(&totp_instance) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to generate QR PNG");
+            return Err(());
+        }
+    };
+    // Encrypt the base32 form, not the raw secret bytes: generate_secret_bytes()
+    // returns random bytes with no guarantee of being valid UTF-8, so a lossy
+    // string conversion would silently corrupt the secret. Base32 is always
+    // plain ASCII and round-trips losslessly.
+    let encrypted = match encryption::encrypt(encryption_key, &base32) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to encrypt TOTP secret");
+            return Err(());
+        }
+    };
+    Ok((encrypted, base32, png))
+}
+
+/// Builds the "scan this QR" response message (embed + QR attachment + verify
+/// button). `then_yubikey` selects the verify button that chains into YubiKey.
+fn build_totp_qr_response(base32: &str, png: Vec<u8>, then_yubikey: bool) -> CreateInteractionResponseMessage {
+    let attachment = CreateAttachment::bytes(png, "totp-qr.png");
+    let embed = CreateEmbed::new()
+        .title("Scan this QR code")
+        .description(format!("Or enter manually: `{base32}`"))
+        .attachment("totp-qr.png")
+        .color(0x5865F2);
+    let verify_custom_id = if then_yubikey {
+        "totp_verify_button_then_yubikey"
+    } else {
+        "totp_verify_button"
+    };
+    let button = CreateActionRow::Buttons(vec![CreateButton::new(verify_custom_id)
+        .label("I've added it — verify")
+        .style(ButtonStyle::Primary)]);
+    CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .add_file(attachment)
+        .components(vec![button])
+        .ephemeral(true)
+}
+
+/// The YubiKey enrollment modal (touch + paste OTP). Shared by the first-time
+/// enroll path and the post-regenerate continuation button.
+fn yubikey_enroll_modal() -> CreateModal {
+    CreateModal::new("yubikey_enroll_modal", "Enroll YubiKey").components(vec![CreateActionRow::InputText(
+        CreateInputText::new(InputTextStyle::Short, "Touch your YubiKey and paste the OTP", "yubikey_otp")
+            .placeholder("cccc...")
+            .required(true),
+    )])
+}
+
+/// Logs the `LogTier::Alert` "factor regenerating" embed emitted when an
+/// existing factor is deleted to begin regeneration.
+async fn log_factor_regenerating(ctx: &Context, pool: &PgPool, guild_id_i64: i64, user_id: u64, factor_label: &str) {
+    let embed = CreateEmbed::new()
+        .title(format!("{factor_label} Factor Regenerating"))
+        .field("User", crate::logging::user_ref(user_id as i64), true)
+        .field(
+            "Detail",
+            format!("The existing {factor_label} factor was deleted to begin regeneration."),
+            false,
+        )
+        .color(0x5865F2);
+    let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Alert, embed).await;
 }
 
 /// Looks up everything `decide_enrollment_action` needs for one factor and
@@ -621,7 +780,21 @@ async fn handle_totp_button(
             )
             .await;
         }
-        EnrollmentDecision::SelfServiceRegenerate | EnrollmentDecision::ApprovedRegenerate => {
+        EnrollmentDecision::SelfServiceRegenerate => {
+            // Fail closed: an admin self-regenerate needs proof of possessing
+            // the CURRENT factor. Prompt for a backup code via modal and do
+            // NOT touch the existing factor here — the delete + regeneration
+            // happens only after the code verifies, in
+            // handle_totp_regen_backup_modal. (ApprovedRegenerate, below, is a
+            // separate already-stronger path: an admin explicitly approved it.)
+            let modal_id = if then_yubikey {
+                "totp_regen_backup_modal_then_yubikey"
+            } else {
+                "totp_regen_backup_modal"
+            };
+            return open_backup_code_modal(ctx, comp, modal_id, "Regenerate TOTP").await;
+        }
+        EnrollmentDecision::ApprovedRegenerate => {
             let _ = sqlx::query!(
                 "DELETE FROM totp_enrollments WHERE guild_id = $1 AND user_id = $2",
                 guild_id_i64,
@@ -629,45 +802,14 @@ async fn handle_totp_button(
             )
             .execute(pool)
             .await;
-            let embed = serenity::all::CreateEmbed::new()
-                .title("TOTP Factor Regenerating")
-                .field("User", crate::logging::user_ref(comp.user.id.get() as i64), true)
-                .field(
-                    "Detail",
-                    "The existing TOTP factor was deleted to begin regeneration.",
-                    false,
-                )
-                .color(0x5865F2);
-            let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Alert, embed).await;
+            log_factor_regenerating(ctx, pool, guild_id_i64, comp.user.id.get(), "TOTP").await;
         }
         EnrollmentDecision::SelfServiceAdd | EnrollmentDecision::ApprovedAdd => {}
     }
 
-    let secret_bytes = totp::generate_secret_bytes();
-    let account_name = comp.user.id.to_string();
-    let totp_instance = totp::build_totp(secret_bytes, account_name);
-    let base32 = totp::base32_secret(&totp_instance);
-    let png = match totp::provisioning_qr_png(&totp_instance) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to generate QR PNG");
-            return reply_component_ephemeral(ctx, comp, "Something went wrong. Try again later.").await;
-        }
-    };
-
-    // Encrypt the base32 form, not the raw secret bytes: generate_secret_bytes()
-    // returns random bytes with no guarantee of being valid UTF-8 (per its own
-    // doc comment in Plan 1), so a lossy string conversion would silently
-    // corrupt the secret and break verification forever. Base32 is always
-    // plain ASCII, round-trips losslessly, and totp-rs already provides the
-    // decoder via Secret::Encoded(..).to_bytes() (Task 4's Foundation spike
-    // verified this exact Secret::Encoded constructor compiles and works).
-    let encrypted = match encryption::encrypt(encryption_key, &base32) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!(error = ?e, "failed to encrypt TOTP secret");
-            return reply_component_ephemeral(ctx, comp, "Something went wrong. Try again later.").await;
-        }
+    let (encrypted, base32, png) = match generate_totp_material(encryption_key, comp.user.id) {
+        Ok(material) => material,
+        Err(()) => return reply_component_ephemeral(ctx, comp, "Something went wrong. Try again later.").await,
     };
 
     if let Err(e) = sqlx::query!(
@@ -685,25 +827,7 @@ async fn handle_totp_button(
         return reply_component_ephemeral(ctx, comp, "Something went wrong. Try again later.").await;
     }
 
-    let attachment = CreateAttachment::bytes(png, "totp-qr.png");
-    let embed = serenity::all::CreateEmbed::new()
-        .title("Scan this QR code")
-        .description(format!("Or enter manually: `{base32}`"))
-        .attachment("totp-qr.png")
-        .color(0x5865F2);
-    let verify_custom_id = if then_yubikey {
-        "totp_verify_button_then_yubikey"
-    } else {
-        "totp_verify_button"
-    };
-    let button = CreateActionRow::Buttons(vec![serenity::all::CreateButton::new(verify_custom_id)
-        .label("I've added it — verify")
-        .style(serenity::all::ButtonStyle::Primary)]);
-    let msg = serenity::all::CreateInteractionResponseMessage::new()
-        .embed(embed)
-        .add_file(attachment)
-        .components(vec![button])
-        .ephemeral(true);
+    let msg = build_totp_qr_response(&base32, png, then_yubikey);
     let _ = comp
         .create_response(&ctx.http, serenity::all::CreateInteractionResponse::Message(msg))
         .await;
@@ -769,7 +893,16 @@ async fn handle_yubikey_button(ctx: &Context, pool: &PgPool, comp: &ComponentInt
             )
             .await;
         }
-        EnrollmentDecision::SelfServiceRegenerate | EnrollmentDecision::ApprovedRegenerate => {
+        EnrollmentDecision::SelfServiceRegenerate => {
+            // Fail closed: gate the admin self-regenerate behind a backup code.
+            // Since a modal-submit cannot open another modal, the backup-code
+            // modal can't chain straight into `yubikey_enroll_modal`; instead
+            // handle_yubikey_regen_backup_modal verifies + consumes the code,
+            // deletes the old factor, and replies with a button that opens the
+            // enroll modal. (ApprovedRegenerate, below, stays as-is.)
+            return open_backup_code_modal(ctx, comp, "yubikey_regen_backup_modal", "Regenerate YubiKey").await;
+        }
+        EnrollmentDecision::ApprovedRegenerate => {
             let _ = sqlx::query!(
                 "DELETE FROM yubikey_enrollments WHERE guild_id = $1 AND user_id = $2",
                 guild_id_i64,
@@ -777,29 +910,13 @@ async fn handle_yubikey_button(ctx: &Context, pool: &PgPool, comp: &ComponentInt
             )
             .execute(pool)
             .await;
-            let embed = serenity::all::CreateEmbed::new()
-                .title("YubiKey Factor Regenerating")
-                .field("User", crate::logging::user_ref(comp.user.id.get() as i64), true)
-                .field(
-                    "Detail",
-                    "The existing YubiKey factor was deleted to begin regeneration.",
-                    false,
-                )
-                .color(0x5865F2);
-            let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Alert, embed).await;
+            log_factor_regenerating(ctx, pool, guild_id_i64, comp.user.id.get(), "YubiKey").await;
         }
         EnrollmentDecision::SelfServiceAdd | EnrollmentDecision::ApprovedAdd => {}
     }
 
-    let modal = CreateModal::new("yubikey_enroll_modal", "Enroll YubiKey").components(vec![
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Short, "Touch your YubiKey and paste the OTP", "yubikey_otp")
-                .placeholder("cccc...")
-                .required(true),
-        ),
-    ]);
     if let Err(e) = comp
-        .create_response(&ctx.http, serenity::all::CreateInteractionResponse::Modal(modal))
+        .create_response(&ctx.http, serenity::all::CreateInteractionResponse::Modal(yubikey_enroll_modal()))
         .await
     {
         tracing::error!(error = ?e, "failed to open YubiKey enroll modal");
@@ -818,6 +935,12 @@ pub async fn handle_modal(
     }
     if modal.data.custom_id == "yubikey_enroll_modal" {
         handle_yubikey_modal(ctx, pool, yubico, modal).await;
+    }
+    if modal.data.custom_id == "totp_regen_backup_modal" || modal.data.custom_id == "totp_regen_backup_modal_then_yubikey" {
+        handle_totp_regen_backup_modal(ctx, pool, encryption_key, modal).await;
+    }
+    if modal.data.custom_id == "yubikey_regen_backup_modal" {
+        handle_yubikey_regen_backup_modal(ctx, pool, modal).await;
     }
 }
 
@@ -842,19 +965,7 @@ async fn handle_totp_verify_modal(
     let guild_id_i64 = guild_id.get() as i64;
     let user_id_i64 = modal.user.id.get() as i64;
 
-    let submitted_code = modal
-        .data
-        .components
-        .iter()
-        .flat_map(|row| row.components.iter())
-        .find_map(|c| {
-            if let serenity::all::ActionRowComponent::InputText(input) = c {
-                input.value.clone()
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    let submitted_code = first_modal_input(modal);
 
     let row = match sqlx::query!(
         "SELECT totp_secret_encrypted FROM totp_enrollments WHERE guild_id = $1 AND user_id = $2",
@@ -964,19 +1075,7 @@ async fn handle_yubikey_modal(
     let guild_id_i64 = guild_id.get() as i64;
     let user_id_i64 = modal.user.id.get() as i64;
 
-    let submitted_otp = modal
-        .data
-        .components
-        .iter()
-        .flat_map(|row| row.components.iter())
-        .find_map(|c| {
-            if let serenity::all::ActionRowComponent::InputText(input) = c {
-                input.value.clone()
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    let submitted_otp = first_modal_input(modal);
 
     let result = match yubico.verify_otp(&submitted_otp).await {
         Ok(r) => r,
@@ -1029,6 +1128,198 @@ async fn handle_yubikey_modal(
         .field("Factor", "YubiKey enrolled/regenerated", true)
         .color(0x57F287);
     let _ = crate::logging::log(pool, &ctx.http, guild_id_i64, crate::logging::LogTier::Info, embed).await;
+}
+
+/// Self-service TOTP regenerate, gated on a backup code. Called only from the
+/// `totp_regen_backup_modal[_then_yubikey]` submit. Order (requirement #5):
+/// verify the code, then consume it, then delete the old factor — a wrong code
+/// never touches the existing factor.
+async fn handle_totp_regen_backup_modal(
+    ctx: &Context,
+    pool: &PgPool,
+    encryption_key: &[u8; 32],
+    modal: &ModalInteraction,
+) {
+    let Some(guild_id) = modal.guild_id else {
+        return reply_modal_ephemeral(ctx, modal, "This only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = modal.user.id.get() as i64;
+    let then_yubikey = modal.data.custom_id == "totp_regen_backup_modal_then_yubikey";
+    let submitted = first_modal_input(modal);
+
+    // Verify possession BEFORE anything is deleted. Fail closed on a wrong code
+    // or no unused codes left — the existing factor stays fully intact.
+    let matched_id = match find_unused_matching_backup_code(pool, guild_id_i64, user_id_i64, &submitted).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return reply_modal_ephemeral(ctx, modal, REGEN_BACKUP_CODE_FAILED_MSG).await,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to look up backup codes for totp regenerate");
+            return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+        }
+    };
+
+    // Build the new secret up front (pure, no DB) so the transaction below only
+    // spans DB writes.
+    let (encrypted, base32, png) = match generate_totp_material(encryption_key, modal.user.id) {
+        Ok(material) => material,
+        Err(()) => return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await,
+    };
+
+    // consume → delete old → store new, all in one transaction (matching
+    // handle_approve): a failure partway can't consume a code without
+    // regenerating, or delete a factor without recording the consumption.
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to start transaction for totp self-regenerate");
+            return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+        }
+    };
+
+    // Guarded by `used_at IS NULL` so a concurrent submit can't double-spend the
+    // same code; 0 rows affected means it was already used — fail closed.
+    match sqlx::query!(
+        "UPDATE backup_codes SET used_at = now() WHERE id = $1 AND used_at IS NULL",
+        matched_id
+    )
+    .execute(&mut *tx)
+    .await
+    {
+        Ok(r) if r.rows_affected() == 1 => {}
+        Ok(_) => {
+            let _ = tx.rollback().await;
+            return reply_modal_ephemeral(ctx, modal, REGEN_BACKUP_CODE_FAILED_MSG).await;
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to consume backup code for totp regenerate");
+            let _ = tx.rollback().await;
+            return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    if let Err(e) = sqlx::query!(
+        "DELETE FROM totp_enrollments WHERE guild_id = $1 AND user_id = $2",
+        guild_id_i64,
+        user_id_i64
+    )
+    .execute(&mut *tx)
+    .await
+    {
+        tracing::error!(error = ?e, "failed to delete old totp factor during self-regenerate");
+        let _ = tx.rollback().await;
+        return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+    }
+
+    if let Err(e) = sqlx::query!(
+        "INSERT INTO totp_enrollments (guild_id, user_id, totp_secret_encrypted, verified)
+         VALUES ($1, $2, $3, false)
+         ON CONFLICT (guild_id, user_id) DO UPDATE SET totp_secret_encrypted = EXCLUDED.totp_secret_encrypted, verified = false, enrolled_at = now()",
+        guild_id_i64,
+        user_id_i64,
+        encrypted
+    )
+    .execute(&mut *tx)
+    .await
+    {
+        tracing::error!(error = ?e, "failed to store new totp secret during self-regenerate");
+        let _ = tx.rollback().await;
+        return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!(error = ?e, "failed to commit totp self-regenerate transaction");
+        return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+    }
+
+    log_factor_regenerating(ctx, pool, guild_id_i64, modal.user.id.get(), "TOTP").await;
+
+    // TOTP's next step is a QR message, which is a legal response to a modal
+    // submit, so it chains directly here.
+    let msg = build_totp_qr_response(&base32, png, then_yubikey);
+    let _ = modal
+        .create_response(&ctx.http, serenity::all::CreateInteractionResponse::Message(msg))
+        .await;
+}
+
+/// Self-service YubiKey regenerate, gated on a backup code. Called only from the
+/// `yubikey_regen_backup_modal` submit. Same verify→consume→delete order as the
+/// TOTP path. Because a modal submit cannot open another modal, this replies
+/// with a button that opens `yubikey_enroll_modal` rather than chaining into it.
+async fn handle_yubikey_regen_backup_modal(ctx: &Context, pool: &PgPool, modal: &ModalInteraction) {
+    let Some(guild_id) = modal.guild_id else {
+        return reply_modal_ephemeral(ctx, modal, "This only works in a server.").await;
+    };
+    let guild_id_i64 = guild_id.get() as i64;
+    let user_id_i64 = modal.user.id.get() as i64;
+    let submitted = first_modal_input(modal);
+
+    let matched_id = match find_unused_matching_backup_code(pool, guild_id_i64, user_id_i64, &submitted).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return reply_modal_ephemeral(ctx, modal, REGEN_BACKUP_CODE_FAILED_MSG).await,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to look up backup codes for yubikey regenerate");
+            return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+        }
+    };
+
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to start transaction for yubikey self-regenerate");
+            return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+        }
+    };
+
+    match sqlx::query!(
+        "UPDATE backup_codes SET used_at = now() WHERE id = $1 AND used_at IS NULL",
+        matched_id
+    )
+    .execute(&mut *tx)
+    .await
+    {
+        Ok(r) if r.rows_affected() == 1 => {}
+        Ok(_) => {
+            let _ = tx.rollback().await;
+            return reply_modal_ephemeral(ctx, modal, REGEN_BACKUP_CODE_FAILED_MSG).await;
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to consume backup code for yubikey regenerate");
+            let _ = tx.rollback().await;
+            return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+        }
+    }
+
+    if let Err(e) = sqlx::query!(
+        "DELETE FROM yubikey_enrollments WHERE guild_id = $1 AND user_id = $2",
+        guild_id_i64,
+        user_id_i64
+    )
+    .execute(&mut *tx)
+    .await
+    {
+        tracing::error!(error = ?e, "failed to delete old yubikey factor during self-regenerate");
+        let _ = tx.rollback().await;
+        return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+    }
+
+    if let Err(e) = tx.commit().await {
+        tracing::error!(error = ?e, "failed to commit yubikey self-regenerate transaction");
+        return reply_modal_ephemeral(ctx, modal, "Something went wrong. Try again later.").await;
+    }
+
+    log_factor_regenerating(ctx, pool, guild_id_i64, modal.user.id.get(), "YubiKey").await;
+
+    let button = CreateActionRow::Buttons(vec![CreateButton::new("yubikey_enroll_after_regen")
+        .label("Continue: Enroll YubiKey")
+        .style(ButtonStyle::Primary)]);
+    let msg = CreateInteractionResponseMessage::new()
+        .content("Backup code accepted — your old YubiKey factor was removed. Now enroll your new YubiKey:")
+        .components(vec![button])
+        .ephemeral(true);
+    let _ = modal
+        .create_response(&ctx.http, serenity::all::CreateInteractionResponse::Message(msg))
+        .await;
 }
 
 /// If this is the user's very first verified factor of any kind (checked

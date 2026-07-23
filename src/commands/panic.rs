@@ -102,9 +102,13 @@ pub async fn handle(
         let is_admin = auth::is_bot_admin(pool, guild_id_i64, user_id_i64).await.unwrap_or(false);
         let bypassed = if is_admin {
             match authcode {
-                Some(code) => elevation::verify_code(pool, guild_id_i64, user_id_i64, &code, encryption_key, yubico)
-                    .await
-                    .unwrap_or(false),
+                // Exempt: this IS the emergency path — an admin must be able to
+                // bypass the post-panic cooldown to re-trigger panic even if
+                // they've been fumbling codes elsewhere. Attempts still recorded.
+                Some(code) => matches!(
+                    elevation::verify_code(pool, guild_id_i64, user_id_i64, &code, encryption_key, yubico, elevation::LockoutPolicy::Exempt).await,
+                    Ok(elevation::VerifyOutcome::Verified)
+                ),
                 None => false,
             }
         } else {

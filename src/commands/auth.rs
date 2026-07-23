@@ -9,9 +9,6 @@ use serenity::all::{
 };
 use sqlx::PgPool;
 
-const LOCKOUT_WINDOW_MINUTES: i32 = 30;
-const LOCKOUT_THRESHOLD: i64 = 5;
-
 pub fn commands() -> Vec<CreateCommand> {
     vec![
         CreateCommand::new("auth")
@@ -67,17 +64,6 @@ async fn reply_followup(ctx: &Context, cmd: &CommandInteraction, content: &str) 
     let _ = cmd.create_followup(&ctx.http, msg).await;
 }
 
-async fn record_attempt(pool: &PgPool, guild_id_i64: i64, user_id_i64: i64, success: bool) {
-    let _ = sqlx::query!(
-        "INSERT INTO auth_attempts (guild_id, user_id, success) VALUES ($1, $2, $3)",
-        guild_id_i64,
-        user_id_i64,
-        success
-    )
-    .execute(pool)
-    .await;
-}
-
 async fn handle_auth(
     ctx: &Context,
     pool: &PgPool,
@@ -100,38 +86,6 @@ async fn handle_auth(
             tracing::error!(error = ?e, "failed to check panic active state");
             return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
         }
-    }
-
-    // --- Lockout check ---
-    let failure_count = match sqlx::query!(
-        "SELECT COUNT(*) AS count FROM auth_attempts
-         WHERE guild_id = $1 AND user_id = $2 AND success = false
-           AND attempted_at > now() - make_interval(mins => $3)",
-        guild_id_i64,
-        user_id_i64,
-        LOCKOUT_WINDOW_MINUTES
-    )
-    .fetch_one(pool)
-    .await
-    {
-        Ok(row) => row.count.unwrap_or(0),
-        Err(e) => {
-            tracing::error!(error = ?e, "failed to check auth lockout");
-            return reply_ephemeral(ctx, cmd, "Something went wrong. Try again later.").await;
-        }
-    };
-    if failure_count >= LOCKOUT_THRESHOLD {
-        let embed = CreateEmbed::new()
-            .title("Auth Lockout")
-            .field("User", user_ref(cmd.user.id.get() as i64), true)
-            .field(
-                "Failed Attempts",
-                format!("{failure_count} in the last {LOCKOUT_WINDOW_MINUTES} minutes"),
-                true,
-            )
-            .color(0xED4245);
-        let _ = log(pool, &ctx.http, guild_id_i64, LogTier::Alert, embed).await;
-        return reply_ephemeral(ctx, cmd, "Too many failed attempts. Try again later.").await;
     }
 
     // Eligibility checks, code verification (possible live Yubico HTTP call),
@@ -207,26 +161,36 @@ async fn handle_auth(
     }
 
     // --- Verify the code ---
-    if elevation::detect_code_shape(&code).is_none() {
-        record_attempt(pool, guild_id_i64, user_id_i64, false).await;
-        return reply_followup(ctx, cmd, "That doesn't look like a valid code.").await;
-    }
-
-    let verified = match elevation::verify_code(pool, guild_id_i64, user_id_i64, &code, encryption_key, yubico).await {
-        Ok(v) => v,
+    // The lockout gate, code-shape detection, real TOTP/YubiKey verification,
+    // and auth_attempts recording all now live in elevation::verify_code
+    // (LockoutPolicy::Enforce), making this /auth's single verification
+    // touchpoint — no more inline lockout query, shape check, or scattered
+    // record_attempt calls. This runs after defer, so replies go through
+    // reply_followup. Two intentional consequences of centralizing versus the
+    // old inline code, both documented in the refactor report:
+    //   * The lockout gate now fires here, after the eligibility/pair load
+    //     above, rather than before it. A locked-out user who ALSO holds no
+    //     eligible role now exits at the "no registered role" check above
+    //     instead of seeing the lockout message — they never reach
+    //     verification either way, so it's not a brute-force surface.
+    //   * An unrecognized code now returns "That code didn't verify." (the
+    //     verify_code Invalid message) rather than the old distinct "That
+    //     doesn't look like a valid code." — the failed attempt is still
+    //     recorded and still counts toward lockout, only the wording folds in.
+    match elevation::verify_code(pool, guild_id_i64, user_id_i64, &code, encryption_key, yubico, elevation::LockoutPolicy::Enforce).await {
+        Ok(elevation::VerifyOutcome::Verified) => {}
+        Ok(elevation::VerifyOutcome::Invalid) => {
+            return reply_followup(ctx, cmd, "That code didn't verify.").await;
+        }
+        Ok(elevation::VerifyOutcome::LockedOut { failure_count }) => {
+            crate::logging::log_auth_lockout(pool, &ctx.http, guild_id_i64, user_id_i64, failure_count).await;
+            return reply_followup(ctx, cmd, "Too many failed attempts. Try again later.").await;
+        }
         Err(e) => {
             tracing::error!(error = ?e, "error while verifying auth code");
-            record_attempt(pool, guild_id_i64, user_id_i64, false).await;
             return reply_followup(ctx, cmd, "Something went wrong. Try again later.").await;
         }
-    };
-
-    if !verified {
-        record_attempt(pool, guild_id_i64, user_id_i64, false).await;
-        return reply_followup(ctx, cmd, "That code didn't verify.").await;
     }
-
-    record_attempt(pool, guild_id_i64, user_id_i64, true).await;
 
     // --- Grant every eligible pair independently ---
     let Some(member) = cmd.member.as_ref() else {

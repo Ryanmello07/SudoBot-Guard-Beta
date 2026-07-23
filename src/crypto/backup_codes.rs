@@ -36,6 +36,16 @@ pub fn verify_code(code: &str, hash: &str) -> bool {
         .is_ok()
 }
 
+/// Returns the index of the first hash in `hashes` that `code` verifies
+/// against, or `None` if it matches none of them.
+///
+/// Each backup code is independently salted and argon2-hashed, so a submitted
+/// code can't be looked up by value — callers pass the candidate rows' hashes
+/// and use the returned index to identify which specific stored row to consume.
+pub fn find_matching_code_index(code: &str, hashes: &[String]) -> Option<usize> {
+    hashes.iter().position(|hash| verify_code(code, hash))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +88,35 @@ mod tests {
     #[test]
     fn verify_rejects_malformed_hash() {
         assert!(!verify_code("ABCDE23456", "not-a-real-argon2-hash"));
+    }
+
+    #[test]
+    fn find_matching_index_returns_position_of_matching_hash() {
+        let hashes = vec![hash_code("AAAAA11111"), hash_code("BBBBB22222"), hash_code("CCCCC33333")];
+        assert_eq!(find_matching_code_index("BBBBB22222", &hashes), Some(1));
+    }
+
+    #[test]
+    fn find_matching_index_returns_first_match_when_duplicates_present() {
+        // Same code hashed twice (different salts) — should return the earliest.
+        let hashes = vec![hash_code("AAAAA11111"), hash_code("DUPDUP7777"), hash_code("DUPDUP7777")];
+        assert_eq!(find_matching_code_index("DUPDUP7777", &hashes), Some(1));
+    }
+
+    #[test]
+    fn find_matching_index_returns_none_when_no_hash_matches() {
+        let hashes = vec![hash_code("AAAAA11111"), hash_code("BBBBB22222")];
+        assert_eq!(find_matching_code_index("ZZZZZ99999", &hashes), None);
+    }
+
+    #[test]
+    fn find_matching_index_returns_none_for_empty_hash_list() {
+        assert_eq!(find_matching_code_index("AAAAA11111", &[]), None);
+    }
+
+    #[test]
+    fn find_matching_index_skips_malformed_hashes_and_finds_valid_match() {
+        let hashes = vec!["not-a-hash".to_string(), hash_code("AAAAA11111")];
+        assert_eq!(find_matching_code_index("AAAAA11111", &hashes), Some(1));
     }
 }
