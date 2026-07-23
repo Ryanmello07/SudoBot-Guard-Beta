@@ -211,7 +211,20 @@ stage_build() {
     fi
 
     log_info "Building release binary (this can take a while on 1 vCPU)..."
-    sudo -u "${SERVICE_USER}" bash -c "
+    # sqlx::query! macros type-check against a LIVE database at compile time
+    # (this repo has no offline .sqlx cache), so DATABASE_URL must be set for
+    # the build itself -- even though the persisted .env with this same value
+    # isn't written until stage_secrets, later. stage_postgres (which already
+    # ran) left the app role's password at /root/.sudobot_db_password
+    # specifically so both this stage and stage_secrets can read it; read it
+    # here WITHOUT shredding it, since stage_secrets still needs to consume
+    # and shred it too.
+    if [[ ! -f /root/.sudobot_db_password ]]; then
+        die "Expected /root/.sudobot_db_password from stage_postgres — run that stage first."
+    fi
+    local db_password
+    db_password="$(cat /root/.sudobot_db_password)"
+    sudo -u "${SERVICE_USER}" env "DATABASE_URL=postgres://${DB_APP_ROLE}:${db_password}@localhost/${DB_NAME}" bash -c "
         source \"\$HOME/.cargo/env\"
         cd '${APP_DIR}' && cargo build --release
     "
